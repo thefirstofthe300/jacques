@@ -1,0 +1,2 @@
+#!/bin/sh
+exec flatpak run --filesystem=host --command=makemkvcon com.makemkv.MakeMKV "$@"

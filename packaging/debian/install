@@ -1,0 +1,4 @@
+packaging/systemd/jacques.service lib/systemd/system/
+packaging/systemd/sysusers.d/jacques.conf usr/lib/sysusers.d/
+packaging/systemd/tmpfiles.d/jacques.conf usr/lib/tmpfiles.d/
+packaging/rpm/jacques.conf etc/jacques/

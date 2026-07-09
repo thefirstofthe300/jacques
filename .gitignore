@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Runtime state
+*.db
+*.db-journal
+result
+result-*
+
+# Environment
+.env
+
+# Claude Code local state
+.claude/tasks/

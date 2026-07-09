@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+  <h5 class="mb-0 fw-semibold text-white">Jobs</h5>
+  <span class="text-muted small">
+    <i class="bi bi-arrow-clockwise me-1"></i>Auto-refreshing every 3s
+  </span>
+</div>
+
+<div id="job-list"
+     hx-get="/partials/jobs"
+     hx-trigger="every 3s"
+     hx-swap="innerHTML">
+  {% include "partials/job_list.html" %}
+</div>
+{% endblock %}

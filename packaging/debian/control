@@ -1,0 +1,39 @@
+Source: jacques
+Section: utils
+Priority: optional
+Maintainer: Jacques Maintainer <maintainer@example.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-python,
+ python3-all,
+ python3-setuptools,
+ python3-build,
+ pybuild-plugin-pyproject,
+Standards-Version: 4.6.2
+Homepage: https://github.com/thefirstofthe300/jacques
+Rules-Requires-Root: no
+
+Package: jacques
+Architecture: all
+Depends:
+ ${python3:Depends},
+ ${misc:Depends},
+ python3-fastapi,
+ python3-uvicorn,
+ python3-jinja2,
+ python3-multipart,
+ python3-sqlalchemy,
+ python3-aiosqlite,
+ python3-pydantic-settings,
+ python3-pyudev,
+ python3-httpx,
+ python3-rich,
+ makemkv-bin,
+ handbrake-cli,
+Description: Automatic disc ripping daemon with web UI
+ Jacques detects disc insertion via udev, rips the disc with MakeMKV,
+ transcodes to H.265/HEVC with HandBrakeCLI, looks up the title on
+ The Movie Database (TMDb), and organises the result in a Plex- or
+ Jellyfin-compatible library layout.
+ .
+ A lightweight web dashboard shows live job status and history.

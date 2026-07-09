@@ -1,0 +1,64 @@
+{% if jobs %}
+  {% for job in jobs %}
+  <div class="card job-card border mb-3">
+    <div class="card-body py-3 px-4">
+      <div class="d-flex justify-content-between align-items-start">
+        <div class="flex-grow-1 me-3">
+          <div class="fw-semibold text-white mb-1">
+            {{ job.display_name }}
+          </div>
+          <div class="drive-path text-muted">
+            <i class="bi bi-hdd me-1"></i>{{ job.drive_path }}
+            {% if job.disc_label and job.disc_label != job.display_name %}
+              <span class="ms-2 text-muted">·</span>
+              <span class="ms-2">{{ job.disc_label }}</span>
+            {% endif %}
+          </div>
+        </div>
+        <div class="d-flex flex-column align-items-end gap-1">
+          <span class="badge status-badge {{ job.status.value | status_class }}">
+            {{ job.status.value.replace("_", " ") }}
+          </span>
+          {% if job.disc_type.value != "unknown" %}
+          <span class="badge status-badge bg-secondary">
+            {% if job.disc_type.value == "tv_show" %}
+              <i class="bi bi-tv me-1"></i>TV
+            {% else %}
+              <i class="bi bi-camera-film me-1"></i>Movie
+            {% endif %}
+          </span>
+          {% endif %}
+        </div>
+      </div>
+
+      {% if job.is_active and job.status.value not in ("detected",) %}
+      <div class="progress mt-3" style="height: 5px;">
+        <div class="progress-bar bg-primary progress-bar-striped progress-bar-animated"
+             role="progressbar"
+             style="width: {{ job.progress }}%"
+             aria-valuenow="{{ job.progress }}"
+             aria-valuemin="0"
+             aria-valuemax="100">
+        </div>
+      </div>
+      {% endif %}
+
+      {% if job.error_message %}
+      <div class="mt-2 small text-danger">
+        <i class="bi bi-exclamation-triangle-fill me-1"></i>{{ job.error_message }}
+      </div>
+      {% endif %}
+
+      <div class="mt-2 small text-muted">
+        <i class="bi bi-clock me-1"></i>{{ job.created_at.strftime("%Y-%m-%d %H:%M") }}
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+{% else %}
+  <div class="text-center py-5">
+    <i class="bi bi-disc display-4 text-muted mb-3 d-block"></i>
+    <p class="text-muted mb-1">No jobs yet.</p>
+    <p class="text-muted small">Insert a disc to get started.</p>
+  </div>
+{% endif %}
