@@ -1,0 +1,308 @@
+"""Tests for POST /api/jobs/{job_id}/rerun/{stage}.
+
+Uses an in-memory SQLite DB (db_factory fixture), an httpx AsyncClient backed
+by the real FastAPI app, and a mock asyncio.Queue injected into app.state so
+we can assert enqueue behaviour without running the daemon.
+"""
+import asyncio
+from unittest.mock import AsyncMock
+
+import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+from jacques.api.app import app
+from jacques.database import get_db
+from jacques.models.job import DiscType, Job, JobStatus
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+
+async def _create_job(
+    db_factory,
+    *,
+    status: JobStatus = JobStatus.FAILED,
+    drive_path: str = "/dev/sr0",
+    disc_label: str | None = "TEST_DISC",
+    progress: int = 50,
+    error_message: str | None = "something went wrong",
+) -> int:
+    async with db_factory() as db:
+        job = Job(
+            drive_path=drive_path,
+            disc_label=disc_label,
+            status=status,
+            progress=progress,
+            error_message=error_message,
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+        return job.id
+
+
+async def _get_job(db_factory, job_id: int) -> Job:
+    async with db_factory() as db:
+        return await db.get(Job, job_id)
+
+
+# ── fixtures ──────────────────────────────────────────────────────────────────
+
+
+@pytest_asyncio.fixture
+async def mock_queue():
+    """A real asyncio.Queue we can inspect after the request."""
+    return asyncio.Queue()
+
+
+@pytest_asyncio.fixture
+async def api_client(db_factory, mock_queue):
+    """AsyncClient wired to the FastAPI app with:
+    - get_db overridden to use the in-memory db_factory
+    - app.state.rerun_queue set to mock_queue
+    """
+    async def _override_get_db():
+        async with db_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    app.state.rerun_queue = mock_queue
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        yield client
+
+    app.dependency_overrides.clear()
+
+
+# ── 404 — job not found ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerun_404_job_not_found(api_client):
+    response = await api_client.post("/api/jobs/99999/rerun/fetching_metadata")
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()
+
+
+# ── 400 — invalid stage ───────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerun_400_invalid_stage(api_client, db_factory):
+    job_id = await _create_job(db_factory)
+    response = await api_client.post(f"/api/jobs/{job_id}/rerun/bad_stage")
+    assert response.status_code == 400
+    detail = response.json()["detail"]
+    assert "bad_stage" in detail
+    assert "Valid stages" in detail
+
+
+# ── 409 — active job ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerun_409_active_job_ripping(api_client, db_factory):
+    """A job in RIPPING status is active; rerun must be rejected."""
+    job_id = await _create_job(db_factory, status=JobStatus.RIPPING, error_message=None)
+    response = await api_client.post(f"/api/jobs/{job_id}/rerun/fetching_metadata")
+    assert response.status_code == 409
+    assert "active" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_rerun_409_active_job_transcoding_status(api_client, db_factory):
+    """A job in TRANSCODING status is active even when stage=transcoding is requested."""
+    job_id = await _create_job(db_factory, status=JobStatus.TRANSCODING, error_message=None)
+    response = await api_client.post(f"/api/jobs/{job_id}/rerun/transcoding")
+    assert response.status_code == 409
+    assert "active" in response.json()["detail"].lower()
+
+
+# ── 409 — temp file prerequisites missing ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerun_409_transcoding_no_raw_done(api_client, db_factory, tmp_path, monkeypatch):
+    """stage=transcoding without raw/.done marker → 409."""
+    import jacques.api.routes.jobs as jobs_module
+
+    monkeypatch.setattr(jobs_module.settings, "temp_path", tmp_path)
+
+    job_id = await _create_job(db_factory)
+    # raw dir exists but no .done marker
+    raw_dir = tmp_path / str(job_id) / "raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "title_t00.mkv").write_bytes(b"partial rip")
+
+    response = await api_client.post(f"/api/jobs/{job_id}/rerun/transcoding")
+    assert response.status_code == 409
+    assert "raw" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_rerun_409_organizing_no_transcoded_done(api_client, db_factory, tmp_path, monkeypatch):
+    """stage=organizing without transcoded/.done marker → 409."""
+    import jacques.api.routes.jobs as jobs_module
+
+    monkeypatch.setattr(jobs_module.settings, "temp_path", tmp_path)
+
+    job_id = await _create_job(db_factory)
+    # transcoded dir exists but no .done marker
+    transcoded_dir = tmp_path / str(job_id) / "transcoded"
+    transcoded_dir.mkdir(parents=True)
+    (transcoded_dir / "film.mkv").write_bytes(b"incomplete")
+
+    response = await api_client.post(f"/api/jobs/{job_id}/rerun/organizing")
+    assert response.status_code == 409
+    assert "transcoded" in response.json()["detail"].lower()
+
+
+# ── 202 happy path — generic stage (fetching_metadata) ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerun_202_fetching_metadata(api_client, db_factory, mock_queue):
+    """FAILED job reruns from fetching_metadata:
+    - 202 response with job_id and stage
+    - DB: status=FETCHING_METADATA, error_message=None, progress=0
+    - Queue receives (job_id, JobStatus.FETCHING_METADATA)
+    """
+    job_id = await _create_job(db_factory, status=JobStatus.FAILED, progress=42)
+
+    response = await api_client.post(f"/api/jobs/{job_id}/rerun/fetching_metadata")
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_id"] == job_id
+    assert body["stage"] == "fetching_metadata"
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.FETCHING_METADATA
+    assert job.error_message is None
+    assert job.progress == 0
+
+    assert not mock_queue.empty()
+    enqueued = mock_queue.get_nowait()
+    assert enqueued == (job_id, JobStatus.FETCHING_METADATA)
+
+
+@pytest.mark.asyncio
+async def test_rerun_202_identifying(api_client, db_factory, mock_queue):
+    """COMPLETE job reruns from identifying (no temp file check needed).
+    - 202 response
+    - DB: status=IDENTIFYING, error_message=None, progress=0
+    - Queue receives (job_id, JobStatus.IDENTIFYING)
+    """
+    job_id = await _create_job(
+        db_factory, status=JobStatus.COMPLETE, progress=100, error_message=None
+    )
+
+    response = await api_client.post(f"/api/jobs/{job_id}/rerun/identifying")
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_id"] == job_id
+    assert body["stage"] == "identifying"
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.IDENTIFYING
+    assert job.error_message is None
+    assert job.progress == 0
+
+    assert not mock_queue.empty()
+    enqueued = mock_queue.get_nowait()
+    assert enqueued == (job_id, JobStatus.IDENTIFYING)
+
+
+# ── 202 — transcoding with raw/.done present ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerun_202_transcoding_with_raw_done(api_client, db_factory, mock_queue, tmp_path, monkeypatch):
+    """FAILED job, stage=transcoding, raw/.done exists:
+    - 202 response
+    - DB: status=TRANSCODING, error_message=None, progress=0
+    - Queue receives (job_id, JobStatus.TRANSCODING)
+    """
+    import jacques.api.routes.jobs as jobs_module
+
+    monkeypatch.setattr(jobs_module.settings, "temp_path", tmp_path)
+
+    job_id = await _create_job(db_factory, status=JobStatus.FAILED, progress=30)
+
+    # Create the raw/.done marker that the endpoint requires
+    raw_dir = tmp_path / str(job_id) / "raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / ".done").touch()
+    (raw_dir / "title_t00.mkv").write_bytes(b"raw ripped content")
+
+    response = await api_client.post(f"/api/jobs/{job_id}/rerun/transcoding")
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_id"] == job_id
+    assert body["stage"] == "transcoding"
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.TRANSCODING
+    assert job.error_message is None
+    assert job.progress == 0
+
+    assert not mock_queue.empty()
+    enqueued = mock_queue.get_nowait()
+    assert enqueued == (job_id, JobStatus.TRANSCODING)
+
+
+# ── 202 — organizing with transcoded/.done present ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerun_202_organizing_with_transcoded_done(api_client, db_factory, mock_queue, tmp_path, monkeypatch):
+    """FAILED job, stage=organizing, transcoded/.done exists:
+    - 202 response
+    - DB: status=ORGANIZING, error_message=None, progress=0
+    - Queue receives (job_id, JobStatus.ORGANIZING)
+    """
+    import jacques.api.routes.jobs as jobs_module
+
+    monkeypatch.setattr(jobs_module.settings, "temp_path", tmp_path)
+
+    job_id = await _create_job(db_factory, status=JobStatus.FAILED, progress=75)
+
+    # Create the transcoded/.done marker
+    transcoded_dir = tmp_path / str(job_id) / "transcoded"
+    transcoded_dir.mkdir(parents=True)
+    (transcoded_dir / ".done").touch()
+    (transcoded_dir / "film.mkv").write_bytes(b"h265 content")
+
+    response = await api_client.post(f"/api/jobs/{job_id}/rerun/organizing")
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_id"] == job_id
+    assert body["stage"] == "organizing"
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.ORGANIZING
+    assert job.error_message is None
+    assert job.progress == 0
+
+    assert not mock_queue.empty()
+    enqueued = mock_queue.get_nowait()
+    assert enqueued == (job_id, JobStatus.ORGANIZING)
+
+
+# ── queue isolation — only one item enqueued per request ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerun_enqueues_exactly_one_item(api_client, db_factory, mock_queue):
+    """Confirm exactly one tuple is put on the queue per successful rerun."""
+    job_id = await _create_job(db_factory, status=JobStatus.FAILED)
+
+    await api_client.post(f"/api/jobs/{job_id}/rerun/fetching_metadata")
+
+    assert mock_queue.qsize() == 1
