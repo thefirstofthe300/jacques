@@ -1,4 +1,6 @@
 import asyncio
+import dataclasses
+import json
 import logging
 import shutil
 from pathlib import Path
@@ -14,7 +16,7 @@ from .models.job import DiscType, Job, JobStatus
 from .services.detector import DiscDetector
 from .services.metadata import MediaInfo, MetadataService
 from .services.organizer import Organizer
-from .services.ripper import Ripper
+from .services.ripper import Ripper, TitleInfo
 from .services.transcoder import Transcoder
 
 log = logging.getLogger(__name__)
@@ -123,6 +125,13 @@ async def _run_pipeline(
             job = await db.get(Job, job_id)
             if job is not None:
                 disc_type_hint = job.disc_type
+                if job.titles_json:
+                    all_titles = [TitleInfo(**t) for t in json.loads(job.titles_json)]
+                    titles_to_rip = (
+                        all_titles
+                        if disc_type_hint == DiscType.TV_SHOW
+                        else [ripper.select_main_title(all_titles)]
+                    )
                 if not _should_run(JobStatus.FETCHING_METADATA, start_stage) and job.title:
                     media_info = MediaInfo(
                         title=job.title,
@@ -150,7 +159,11 @@ async def _run_pipeline(
                 )
 
             disc_type_hint = DiscType.TV_SHOW if ripper.is_tv_show_hint(titles) else DiscType.MOVIE
-            await _update_job(job_id, disc_type=disc_type_hint)
+            await _update_job(
+                job_id,
+                disc_type=disc_type_hint,
+                titles_json=json.dumps([dataclasses.asdict(t) for t in titles]),
+            )
 
             titles_to_rip = titles if disc_type_hint == DiscType.TV_SHOW else [ripper.select_main_title(titles)]
 
