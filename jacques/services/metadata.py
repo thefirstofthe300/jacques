@@ -90,6 +90,56 @@ class MetadataService:
 
         return candidates
 
+    async def lookup_by_id(self, tmdb_id: int, disc_type: DiscType) -> MediaInfo:
+        """Fetch metadata for a specific TMDb ID.
+
+        Raises ValueError on 404 or any HTTP error.
+        """
+        if disc_type == DiscType.UNKNOWN:
+            log.warning(
+                "lookup_by_id called with DiscType.UNKNOWN for tmdb_id=%d; treating as MOVIE",
+                tmdb_id,
+            )
+            disc_type = DiscType.MOVIE
+
+        if disc_type == DiscType.TV_SHOW:
+            url = f"{_TMDB_BASE}/tv/{tmdb_id}"
+        else:
+            url = f"{_TMDB_BASE}/movie/{tmdb_id}"
+
+        async with httpx.AsyncClient(timeout=10) as client:
+            try:
+                resp = await client.get(url, params={"api_key": self._api_key})
+            except httpx.HTTPError as exc:
+                raise ValueError(f"TMDb request failed: {exc}") from exc
+
+        if resp.status_code == 404:
+            raise ValueError(f"TMDB ID {tmdb_id} not found")
+        if resp.status_code != 200:
+            raise ValueError(f"TMDb request failed: HTTP {resp.status_code}")
+
+        data = resp.json()
+
+        if disc_type == DiscType.TV_SHOW:
+            title = data.get("name", "")
+            date_str = data.get("first_air_date") or ""
+        else:
+            title = data.get("title", "")
+            date_str = data.get("release_date") or ""
+
+        year = int(date_str[:4]) if date_str else None
+        overview = (data.get("overview") or "")[:200]
+        popularity = float(data.get("popularity", 0))
+
+        return MediaInfo(
+            title=title,
+            year=year,
+            disc_type=disc_type,
+            tmdb_id=tmdb_id,
+            overview=overview,
+            popularity=popularity,
+        )
+
     async def _search_movie(
         self, client: httpx.AsyncClient, query: str
     ) -> list[MediaInfo]:

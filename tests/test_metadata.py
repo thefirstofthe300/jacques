@@ -246,3 +246,84 @@ async def test_identify_returns_single_for_exactly_one_result():
 
     assert isinstance(result, MediaInfo)
     assert result.tmdb_id == 30
+
+
+# ---------------------------------------------------------------------------
+# lookup_by_id tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_lookup_by_id_movie():
+    svc = MetadataService(api_key="testkey")
+
+    with respx.mock:
+        respx.get(f"{_BASE}/movie/550").mock(
+            return_value=httpx.Response(200, json={
+                "title": "Fight Club",
+                "release_date": "1999-10-15",
+                "overview": "An insomniac office worker forms an underground fight club.",
+                "popularity": 50.0,
+            })
+        )
+        result = await svc.lookup_by_id(550, DiscType.MOVIE)
+
+    assert result.title == "Fight Club"
+    assert result.year == 1999
+    assert result.disc_type == DiscType.MOVIE
+    assert result.tmdb_id == 550
+    assert result.popularity == 50.0
+    assert "insomniac" in result.overview
+
+
+@pytest.mark.asyncio
+async def test_lookup_by_id_tv():
+    svc = MetadataService(api_key="testkey")
+
+    with respx.mock:
+        respx.get(f"{_BASE}/tv/1396").mock(
+            return_value=httpx.Response(200, json={
+                "name": "Breaking Bad",
+                "first_air_date": "2008-01-20",
+                "overview": "A chemistry teacher turns to cooking meth.",
+                "popularity": 100.0,
+            })
+        )
+        result = await svc.lookup_by_id(1396, DiscType.TV_SHOW)
+
+    assert result.title == "Breaking Bad"
+    assert result.year == 2008
+    assert result.disc_type == DiscType.TV_SHOW
+    assert result.tmdb_id == 1396
+    assert result.popularity == 100.0
+
+
+@pytest.mark.asyncio
+async def test_lookup_by_id_not_found():
+    svc = MetadataService(api_key="testkey")
+
+    with respx.mock:
+        respx.get(f"{_BASE}/movie/999999").mock(
+            return_value=httpx.Response(404, json={"status_message": "The resource you requested could not be found."})
+        )
+        with pytest.raises(ValueError, match="999999"):
+            await svc.lookup_by_id(999999, DiscType.MOVIE)
+
+
+@pytest.mark.asyncio
+async def test_lookup_by_id_unknown_disc_type_treated_as_movie():
+    svc = MetadataService(api_key="testkey")
+
+    with respx.mock:
+        respx.get(f"{_BASE}/movie/550").mock(
+            return_value=httpx.Response(200, json={
+                "title": "Fight Club",
+                "release_date": "1999-10-15",
+                "overview": "An insomniac office worker forms an underground fight club.",
+                "popularity": 50.0,
+            })
+        )
+        result = await svc.lookup_by_id(550, DiscType.UNKNOWN)
+
+    assert result.title == "Fight Club"
+    assert result.disc_type == DiscType.MOVIE
+    assert result.tmdb_id == 550
