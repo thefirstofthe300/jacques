@@ -5,7 +5,6 @@ by the real FastAPI app, and a mock asyncio.Queue injected into app.state so
 we can assert enqueue behaviour without running the daemon.
 """
 import asyncio
-from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -295,6 +294,35 @@ async def test_rerun_202_organizing_with_transcoded_done(api_client, db_factory,
     assert not mock_queue.empty()
     enqueued = mock_queue.get_nowait()
     assert enqueued == (job_id, JobStatus.ORGANIZING)
+
+
+# ── 503 — service not ready (no rerun_queue in app.state) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerun_503_service_not_ready(db_factory):
+    """If rerun_queue is absent from app.state, the endpoint returns 503 rather
+    than raising an AttributeError."""
+    async def _override_get_db():
+        async with db_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    if hasattr(app.state, "rerun_queue"):
+        del app.state.rerun_queue
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            job_id = await _create_job(db_factory, status=JobStatus.FAILED)
+            response = await client.post(f"/api/jobs/{job_id}/rerun/identifying")
+        assert response.status_code == 503
+        assert "not ready" in response.json()["detail"].lower()
+    finally:
+        app.dependency_overrides.clear()
+        if hasattr(app.state, "rerun_queue"):
+            del app.state.rerun_queue
 
 
 # ── queue isolation — only one item enqueued per request ─────────────────────

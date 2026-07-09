@@ -10,6 +10,7 @@ Each integration test uses the same in-memory SQLite db_factory fixture as
 test_pipeline.py and monkeypatches jacques.daemon.settings.temp_path so that
 temp-file probing goes to pytest's tmp_path instead of the real filesystem.
 """
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -475,6 +476,127 @@ async def test_rerun_from_organizing_no_transcoded_done_marker_completes_empty(d
 
     job = await _get_job(db_factory, job_id)
     assert job.status == JobStatus.COMPLETE
+
+
+@pytest.mark.asyncio
+async def test_rerun_from_fetching_metadata_with_raw_files_does_not_transcode(db_factory, tmp_path):
+    """With start_stage=FETCHING_METADATA, raw_paths are NOT pre-loaded from disk
+    (only TRANSCODING/ORGANIZING entry points pre-load them). Even if raw files exist,
+    transcode is never called — ripping produces nothing (no titles_to_rip from
+    the skipped IDENTIFYING stage), so the pipeline reaches COMPLETE with no files moved."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock()
+    mock_ripper.rip = AsyncMock()
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = AsyncMock()
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=None)
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(
+            db_factory, "/dev/sr0", "RAW_EXISTS", disc_type=DiscType.MOVIE
+        )
+        raw_dir = config.settings.temp_path / str(job_id) / "raw"
+        raw_dir.mkdir(parents=True)
+        (raw_dir / "title_t00.mkv").write_bytes(b"raw content")
+        (raw_dir / ".done").touch()
+
+        await daemon._run_pipeline(
+            job_id, "/dev/sr0", "RAW_EXISTS", start_stage=JobStatus.FETCHING_METADATA
+        )
+
+    mock_ripper.rip.assert_not_called()
+    mock_transcoder.transcode.assert_not_called()
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+
+
+# ── _process_reruns() tests ────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_process_reruns_dispatches_pipeline(db_factory, tmp_path):
+    """_process_reruns() dequeues a (job_id, start_stage) tuple and spawns _run_pipeline."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    pipeline_calls: list = []
+
+    async def fake_pipeline(job_id, drive_path, disc_label, start_stage):
+        pipeline_calls.append((job_id, start_stage))
+
+    job_id = await _create_job(
+        db_factory, "/dev/sr0", "TEST_DISC", disc_type=DiscType.MOVIE
+    )
+
+    queue: asyncio.Queue = asyncio.Queue()
+    await queue.put((job_id, JobStatus.TRANSCODING))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon._run_pipeline", AsyncMock(side_effect=fake_pipeline)),
+    ):
+        consumer = asyncio.create_task(daemon._process_reruns(queue))
+        await queue.join()
+        await asyncio.sleep(0)  # let the spawned pipeline task run
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+    assert len(pipeline_calls) == 1
+    assert pipeline_calls[0] == (job_id, JobStatus.TRANSCODING)
+
+
+@pytest.mark.asyncio
+async def test_process_reruns_skips_unknown_job(db_factory, tmp_path):
+    """_process_reruns() warns and skips when the job_id is not found in DB."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    pipeline_calls: list = []
+
+    async def fake_pipeline(*args, **kwargs):
+        pipeline_calls.append(args)
+
+    queue: asyncio.Queue = asyncio.Queue()
+    await queue.put((99999, JobStatus.TRANSCODING))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon._run_pipeline", AsyncMock(side_effect=fake_pipeline)),
+    ):
+        consumer = asyncio.create_task(daemon._process_reruns(queue))
+        await queue.join()
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+    assert pipeline_calls == []
+
+
+@pytest.mark.asyncio
+async def test_process_reruns_cancels_cleanly():
+    """_process_reruns() exits without error when its task is cancelled."""
+    from jacques import daemon
+
+    queue: asyncio.Queue = asyncio.Queue()
+    task = asyncio.create_task(daemon._process_reruns(queue))
+    await asyncio.sleep(0)  # let the task start and block on queue.get()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert task.done()
 
 
 @pytest.mark.asyncio

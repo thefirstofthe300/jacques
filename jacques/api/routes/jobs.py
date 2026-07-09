@@ -114,6 +114,9 @@ async def rerun_job(
     job.progress = 0
     await db.commit()
 
-    await request.app.state.rerun_queue.put((job_id, target_status))
+    queue = getattr(request.app.state, "rerun_queue", None)
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    await queue.put((job_id, target_status))
 
     return JSONResponse(status_code=202, content={"job_id": job_id, "stage": stage})

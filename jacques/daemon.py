@@ -121,23 +121,20 @@ async def _run_pipeline(
     if not _should_run(JobStatus.IDENTIFYING, start_stage):
         async with AsyncSessionLocal() as db:
             job = await db.get(Job, job_id)
-            disc_type_hint = job.disc_type if job is not None else DiscType.UNKNOWN
+            if job is not None:
+                disc_type_hint = job.disc_type
+                if not _should_run(JobStatus.FETCHING_METADATA, start_stage) and job.title:
+                    media_info = MediaInfo(
+                        title=job.title,
+                        year=job.year,
+                        disc_type=job.disc_type,
+                        tmdb_id=job.tmdb_id,
+                    )
 
-    if not _should_run(JobStatus.FETCHING_METADATA, start_stage):
-        async with AsyncSessionLocal() as db:
-            job = await db.get(Job, job_id)
-            if job is not None and job.title:
-                media_info = MediaInfo(
-                    title=job.title,
-                    year=job.year,
-                    disc_type=job.disc_type,
-                    tmdb_id=job.tmdb_id,
-                )
-
-    if start_stage in (JobStatus.FETCHING_METADATA, JobStatus.TRANSCODING):
+    if not _should_run(JobStatus.RIPPING, start_stage):
         raw_paths = sorted(raw_dir.glob("*.mkv"), key=lambda p: p.stat().st_size, reverse=True) if (raw_dir.exists() and (raw_dir / ".done").exists()) else []
 
-    if start_stage in (JobStatus.FETCHING_METADATA, JobStatus.ORGANIZING):
+    if not _should_run(JobStatus.TRANSCODING, start_stage):
         transcoded_paths = sorted(transcoded_dir.glob("*.mkv"), key=lambda p: p.stat().st_size, reverse=True) if (transcoded_dir.exists() and (transcoded_dir / ".done").exists()) else []
 
     try:
@@ -220,7 +217,10 @@ async def _run_pipeline(
 
         # ── ORGANIZING ────────────────────────────────────────────────────────
         await _update_job(job_id, status=JobStatus.ORGANIZING, progress=0)
-        log.info("Job %d: organizing files", job_id)
+        if not transcoded_paths:
+            log.warning("Job %d: organizing with no transcoded files — marking complete", job_id)
+        else:
+            log.info("Job %d: organizing %d file(s)", job_id, len(transcoded_paths))
 
         for i, path in enumerate(transcoded_paths):
             dest = organizer.build_destination(media_info, disc_label, episode_num=i + 1)
