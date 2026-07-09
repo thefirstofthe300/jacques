@@ -1,10 +1,19 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ...config import settings
 from ...database import get_db
 from ...models.job import DiscType, Job, JobStatus
+
+_RERUN_ENTRY_STAGES: dict[str, JobStatus] = {
+    "identifying": JobStatus.IDENTIFYING,
+    "fetching_metadata": JobStatus.FETCHING_METADATA,
+    "transcoding": JobStatus.TRANSCODING,
+    "organizing": JobStatus.ORGANIZING,
+}
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
@@ -58,3 +67,56 @@ async def get_job(job_id: int, db: AsyncSession = Depends(get_db)) -> JobRespons
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return JobResponse.from_job(job)
+
+
+@router.post("/{job_id}/rerun/{stage}", status_code=202)
+async def rerun_job(
+    job_id: int,
+    stage: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    job = await db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    target_status = _RERUN_ENTRY_STAGES.get(stage)
+    if target_status is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid rerun stage {stage!r}. Valid stages: {', '.join(_RERUN_ENTRY_STAGES)}",
+        )
+
+    if job.is_active:
+        raise HTTPException(
+            status_code=409,
+            detail="Job is currently active; wait for it to finish before rerunning",
+        )
+
+    if stage == "transcoding":
+        done_marker = settings.temp_path / str(job_id) / "raw" / ".done"
+        if not done_marker.exists():
+            raise HTTPException(
+                status_code=409,
+                detail="No completed raw files found for this job",
+            )
+
+    if stage == "organizing":
+        done_marker = settings.temp_path / str(job_id) / "transcoded" / ".done"
+        if not done_marker.exists():
+            raise HTTPException(
+                status_code=409,
+                detail="No completed transcoded files found for this job",
+            )
+
+    job.status = target_status
+    job.error_message = None
+    job.progress = 0
+    await db.commit()
+
+    queue = getattr(request.app.state, "rerun_queue", None)
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    await queue.put((job_id, target_status))
+
+    return JSONResponse(status_code=202, content={"job_id": job_id, "stage": stage})

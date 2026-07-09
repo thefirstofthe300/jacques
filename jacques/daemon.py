@@ -78,7 +78,28 @@ async def _find_resumable_paths(
     return [], [], None
 
 
-async def _run_pipeline(job_id: int, drive_path: str, disc_label: str | None) -> None:
+_RERUN_STAGES = [
+    JobStatus.IDENTIFYING,
+    JobStatus.FETCHING_METADATA,
+    JobStatus.RIPPING,
+    JobStatus.TRANSCODING,
+    JobStatus.ORGANIZING,
+]
+
+
+def _should_run(stage: JobStatus, start_stage: JobStatus) -> bool:
+    try:
+        return _RERUN_STAGES.index(stage) >= _RERUN_STAGES.index(start_stage)
+    except ValueError:
+        return True
+
+
+async def _run_pipeline(
+    job_id: int,
+    drive_path: str,
+    disc_label: str | None,
+    start_stage: JobStatus = JobStatus.IDENTIFYING,
+) -> None:
     job_temp = settings.temp_path / str(job_id)
     raw_dir = job_temp / "raw"
     transcoded_dir = job_temp / "transcoded"
@@ -88,84 +109,118 @@ async def _run_pipeline(job_id: int, drive_path: str, disc_label: str | None) ->
     metadata_svc = MetadataService(settings.tmdb_api_key)
     organizer = Organizer(settings.output_path)
 
+    disc_type_hint: DiscType = DiscType.UNKNOWN
+    titles_to_rip: list = []
+    media_info: MediaInfo | None = None
+    raw_paths: list[Path] = []
+    transcoded_paths: list[Path] = []
+    resume_raw: list[Path] = []
+    resume_transcoded: list[Path] = []
+    prior_job_id: int | None = None
+
+    if not _should_run(JobStatus.IDENTIFYING, start_stage):
+        async with AsyncSessionLocal() as db:
+            job = await db.get(Job, job_id)
+            if job is not None:
+                disc_type_hint = job.disc_type
+                if not _should_run(JobStatus.FETCHING_METADATA, start_stage) and job.title:
+                    media_info = MediaInfo(
+                        title=job.title,
+                        year=job.year,
+                        disc_type=job.disc_type,
+                        tmdb_id=job.tmdb_id,
+                    )
+
+    if not _should_run(JobStatus.RIPPING, start_stage):
+        raw_paths = sorted(raw_dir.glob("*.mkv"), key=lambda p: p.stat().st_size, reverse=True) if (raw_dir.exists() and (raw_dir / ".done").exists()) else []
+
+    if not _should_run(JobStatus.TRANSCODING, start_stage):
+        transcoded_paths = sorted(transcoded_dir.glob("*.mkv"), key=lambda p: p.stat().st_size, reverse=True) if (transcoded_dir.exists() and (transcoded_dir / ".done").exists()) else []
+
     try:
         # ── IDENTIFYING ────────────────────────────────────────────────────────
-        await _update_job(job_id, status=JobStatus.IDENTIFYING, progress=0)
-        log.info("Job %d: identifying disc %s", job_id, drive_path)
+        if _should_run(JobStatus.IDENTIFYING, start_stage):
+            await _update_job(job_id, status=JobStatus.IDENTIFYING, progress=0)
+            log.info("Job %d: identifying disc %s", job_id, drive_path)
 
-        titles = await ripper.get_disc_info()
-        if not titles:
-            raise RuntimeError(
-                "No valid titles found on disc (all shorter than the minimum duration)"
-            )
+            titles = await ripper.get_disc_info()
+            if not titles:
+                raise RuntimeError(
+                    "No valid titles found on disc (all shorter than the minimum duration)"
+                )
 
-        disc_type_hint = DiscType.TV_SHOW if ripper.is_tv_show_hint(titles) else DiscType.MOVIE
-        await _update_job(job_id, disc_type=disc_type_hint)
+            disc_type_hint = DiscType.TV_SHOW if ripper.is_tv_show_hint(titles) else DiscType.MOVIE
+            await _update_job(job_id, disc_type=disc_type_hint)
 
-        titles_to_rip = titles if disc_type_hint == DiscType.TV_SHOW else [ripper.select_main_title(titles)]
+            titles_to_rip = titles if disc_type_hint == DiscType.TV_SHOW else [ripper.select_main_title(titles)]
 
         # ── FETCHING METADATA ──────────────────────────────────────────────────
-        await _update_job(job_id, status=JobStatus.FETCHING_METADATA, progress=0)
-        log.info("Job %d: fetching metadata for %r", job_id, disc_label)
+        if _should_run(JobStatus.FETCHING_METADATA, start_stage):
+            await _update_job(job_id, status=JobStatus.FETCHING_METADATA, progress=0)
+            log.info("Job %d: fetching metadata for %r", job_id, disc_label)
 
-        media_info: MediaInfo | None = await metadata_svc.identify(
-            disc_label or "", disc_type_hint
-        )
-        if media_info:
-            await _update_job(
-                job_id,
-                title=media_info.title,
-                year=media_info.year,
-                disc_type=media_info.disc_type,
-                tmdb_id=media_info.tmdb_id,
+            media_info = await metadata_svc.identify(
+                disc_label or "", disc_type_hint
             )
+            if media_info:
+                await _update_job(
+                    job_id,
+                    title=media_info.title,
+                    year=media_info.year,
+                    disc_type=media_info.disc_type,
+                    tmdb_id=media_info.tmdb_id,
+                )
 
         # ── RESUME CHECK ───────────────────────────────────────────────────────
-        resume_raw, resume_transcoded, prior_job_id = await _find_resumable_paths(disc_label, job_id)
+        if start_stage == JobStatus.IDENTIFYING:
+            resume_raw, resume_transcoded, prior_job_id = await _find_resumable_paths(disc_label, job_id)
 
         # ── RIPPING (skipped if resuming from raw or transcoded output) ────────
-        raw_paths: list[Path]
-        if resume_transcoded:
-            raw_paths = resume_raw  # may be empty; only needed for cleanup reference
-        elif resume_raw:
-            raw_paths = resume_raw
-            log.info("Job %d: skipping rip — reusing raw output from job %d", job_id, prior_job_id)
-        else:
-            await _update_job(job_id, status=JobStatus.RIPPING, progress=0)
-            log.info("Job %d: ripping %d title(s)", job_id, len(titles_to_rip))
-            raw_paths = []
-            for i, title in enumerate(titles_to_rip):
-                path = await ripper.rip(
-                    title.id,
-                    raw_dir,
-                    on_progress=_stage_progress(job_id, i, len(titles_to_rip)),
-                    expected_bytes=title.expected_bytes,
-                )
-                raw_paths.append(path)
-            (raw_dir / ".done").touch()
+        if _should_run(JobStatus.RIPPING, start_stage):
+            if resume_transcoded:
+                raw_paths = resume_raw  # may be empty; only needed for cleanup reference
+            elif resume_raw:
+                raw_paths = resume_raw
+                log.info("Job %d: skipping rip — reusing raw output from job %d", job_id, prior_job_id)
+            elif titles_to_rip:
+                await _update_job(job_id, status=JobStatus.RIPPING, progress=0)
+                log.info("Job %d: ripping %d title(s)", job_id, len(titles_to_rip))
+                raw_paths = []
+                for i, title in enumerate(titles_to_rip):
+                    path = await ripper.rip(
+                        title.id,
+                        raw_dir,
+                        on_progress=_stage_progress(job_id, i, len(titles_to_rip)),
+                        expected_bytes=title.expected_bytes,
+                    )
+                    raw_paths.append(path)
+                (raw_dir / ".done").touch()
 
         # ── TRANSCODING (skipped if resuming from transcoded output) ───────────
-        transcoded_paths: list[Path]
-        if resume_transcoded:
-            transcoded_paths = resume_transcoded
-            log.info("Job %d: skipping transcode — reusing transcoded output from job %d", job_id, prior_job_id)
-        else:
-            await _update_job(job_id, status=JobStatus.TRANSCODING, progress=0)
-            log.info("Job %d: transcoding %d file(s)", job_id, len(raw_paths))
-            transcoded_paths = []
-            for i, raw_path in enumerate(raw_paths):
-                out = transcoded_dir / raw_path.name
-                await transcoder.transcode(
-                    raw_path,
-                    out,
-                    on_progress=_stage_progress(job_id, i, len(raw_paths)),
-                )
-                transcoded_paths.append(out)
-            (transcoded_dir / ".done").touch()
+        if _should_run(JobStatus.TRANSCODING, start_stage):
+            if resume_transcoded:
+                transcoded_paths = resume_transcoded
+                log.info("Job %d: skipping transcode — reusing transcoded output from job %d", job_id, prior_job_id)
+            elif raw_paths:
+                await _update_job(job_id, status=JobStatus.TRANSCODING, progress=0)
+                log.info("Job %d: transcoding %d file(s)", job_id, len(raw_paths))
+                transcoded_paths = []
+                for i, raw_path in enumerate(raw_paths):
+                    out = transcoded_dir / raw_path.name
+                    await transcoder.transcode(
+                        raw_path,
+                        out,
+                        on_progress=_stage_progress(job_id, i, len(raw_paths)),
+                    )
+                    transcoded_paths.append(out)
+                (transcoded_dir / ".done").touch()
 
         # ── ORGANIZING ────────────────────────────────────────────────────────
         await _update_job(job_id, status=JobStatus.ORGANIZING, progress=0)
-        log.info("Job %d: organizing files", job_id)
+        if not transcoded_paths:
+            log.warning("Job %d: organizing with no transcoded files — marking complete", job_id)
+        else:
+            log.info("Job %d: organizing %d file(s)", job_id, len(transcoded_paths))
 
         for i, path in enumerate(transcoded_paths):
             dest = organizer.build_destination(media_info, disc_label, episode_num=i + 1)
@@ -181,6 +236,31 @@ async def _run_pipeline(job_id: int, drive_path: str, disc_label: str | None) ->
     except Exception as exc:
         log.exception("Job %d failed: %s", job_id, exc)
         await _update_job(job_id, status=JobStatus.FAILED, error_message=str(exc))
+
+
+async def _process_reruns(queue: asyncio.Queue[tuple[int, JobStatus]]) -> None:
+    while True:
+        try:
+            job_id, start_stage = await queue.get()
+        except asyncio.CancelledError:
+            return
+
+        try:
+            async with AsyncSessionLocal() as db:
+                job = await db.get(Job, job_id)
+
+            if job is None:
+                log.warning("Rerun requested for unknown job %d — skipping", job_id)
+                continue
+
+            asyncio.create_task(
+                _run_pipeline(job_id, job.drive_path, job.disc_label, start_stage),
+                name=f"rerun-{job_id}",
+            )
+        except Exception:
+            log.exception("Failed to start rerun for job %d", job_id)
+        finally:
+            queue.task_done()
 
 
 async def _process_jobs(queue: asyncio.Queue[tuple[str, str | None]]) -> None:
@@ -252,6 +332,7 @@ async def run() -> None:
             log.info("Marked %d interrupted job(s) as failed", len(interrupted))
 
     job_queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
+    rerun_queue: asyncio.Queue[tuple[int, JobStatus]] = asyncio.Queue()
 
     async def _on_disc_inserted(drive_path: str, disc_label: str | None) -> None:
         await job_queue.put((drive_path, disc_label))
@@ -267,9 +348,12 @@ async def run() -> None:
     )
     server = uvicorn.Server(server_config)
 
+    app.state.rerun_queue = rerun_queue
+
     log.info("Web UI available at http://%s:%d", settings.host, settings.port)
 
     async with asyncio.TaskGroup() as tg:
         tg.create_task(server.serve(), name="web-server")
         tg.create_task(detector.run(), name="disc-detector")
         tg.create_task(_process_jobs(job_queue), name="job-processor")
+        tg.create_task(_process_reruns(rerun_queue), name="rerun-processor")

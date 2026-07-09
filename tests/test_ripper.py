@@ -92,8 +92,9 @@ async def test_get_disc_info_parses_valid_title():
     lines = [
         b'TINFO:0,2,0,"Feature Film"\n',
         b'TINFO:0,9,0,"1:45:00"\n',
-        b'TINFO:0,11,0,"title_t00.mkv"\n',
-        b'TINFO:0,27,0,"24"\n',
+        b'TINFO:0,8,0,"24"\n',
+        b'TINFO:0,11,0,"1000000000"\n',
+        b'TINFO:0,27,0,"title_t00.mkv"\n',
     ]
     mock_proc = MagicMock()
     mock_proc.stdout = _async_lines(lines)
@@ -115,10 +116,10 @@ async def test_get_disc_info_filters_short_titles():
     lines = [
         b'TINFO:0,2,0,"Main Feature"\n',
         b'TINFO:0,9,0,"1:45:00"\n',  # 6300s — kept
-        b'TINFO:0,11,0,"t00.mkv"\n',
+        b'TINFO:0,11,0,"0"\n',
         b'TINFO:1,2,0,"Trailer"\n',
         b'TINFO:1,9,0,"0:02:30"\n',  # 150s — filtered
-        b'TINFO:1,11,0,"t01.mkv"\n',
+        b'TINFO:1,11,0,"0"\n',
     ]
     mock_proc = MagicMock()
     mock_proc.stdout = _async_lines(lines)
@@ -138,7 +139,7 @@ async def test_get_disc_info_ignores_non_tinfo_lines():
         b'CINFO:1,0,"some disc info"\n',
         b'TINFO:0,2,0,"The Film"\n',
         b'TINFO:0,9,0,"2:00:00"\n',
-        b'TINFO:0,11,0,"t00.mkv"\n',
+        b'TINFO:0,11,0,"0"\n',
     ]
     mock_proc = MagicMock()
     mock_proc.stdout = _async_lines(lines)
