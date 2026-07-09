@@ -11,6 +11,15 @@ async def _async_lines(lines: list[bytes]):
         yield line
 
 
+def _mock_proc(stdout_lines=None, returncode=0, stderr_data=b""):
+    mock_proc = MagicMock()
+    mock_proc.stdout = _async_lines(stdout_lines or [])
+    mock_proc.returncode = returncode
+    mock_proc.stderr.read = AsyncMock(return_value=stderr_data)
+    mock_proc.wait = AsyncMock(return_value=returncode)
+    return mock_proc
+
+
 @pytest.mark.asyncio
 async def test_transcode_parses_progress(tmp_path):
     lines = [
@@ -24,9 +33,7 @@ async def test_transcode_parses_progress(tmp_path):
         b'"State": "WORKING", "Working": {"Progress": 1.0}\n',
         b'}\n',
     ]
-    mock_proc = MagicMock()
-    mock_proc.stdout = _async_lines(lines)
-    mock_proc.wait = AsyncMock(return_value=0)
+    mock_proc = _mock_proc(stdout_lines=lines)
 
     captured: list[int] = []
 
@@ -45,13 +52,9 @@ async def test_transcode_parses_progress(tmp_path):
 
 @pytest.mark.asyncio
 async def test_transcode_creates_output_parent(tmp_path):
-    mock_proc = MagicMock()
-    mock_proc.stdout = _async_lines([])
-    mock_proc.wait = AsyncMock(return_value=0)
-
     output = tmp_path / "deep" / "nested" / "out.mkv"
 
-    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=_mock_proc())):
         await Transcoder().transcode(tmp_path / "in.mkv", output)
 
     assert output.parent.exists()
@@ -62,32 +65,22 @@ async def test_transcode_no_progress_callback_does_not_raise(tmp_path):
     lines = [
         b"Encoding: task 1 of 1, 50.00 % (100.00 fps)\n",
     ]
-    mock_proc = MagicMock()
-    mock_proc.stdout = _async_lines(lines)
-    mock_proc.wait = AsyncMock(return_value=0)
-
-    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=_mock_proc(stdout_lines=lines))):
         await Transcoder().transcode(tmp_path / "in.mkv", tmp_path / "out.mkv")
 
 
 @pytest.mark.asyncio
 async def test_transcode_raises_on_nonzero_exit(tmp_path):
-    mock_proc = MagicMock()
-    mock_proc.stdout = _async_lines([])
-    mock_proc.wait = AsyncMock(return_value=1)
+    mock_proc = _mock_proc(returncode=1, stderr_data=b"Error: cannot open source file")
 
     with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
-        with pytest.raises(RuntimeError, match="HandBrakeCLI exited with code 1"):
+        with pytest.raises(RuntimeError, match="HandBrakeCLI exited with code 1: Error: cannot open source file"):
             await Transcoder().transcode(tmp_path / "in.mkv", tmp_path / "out.mkv")
 
 
 @pytest.mark.asyncio
 async def test_transcode_uses_encoder_preset(tmp_path):
-    mock_proc = MagicMock()
-    mock_proc.stdout = _async_lines([])
-    mock_proc.wait = AsyncMock(return_value=0)
-
-    mock_exec = AsyncMock(return_value=mock_proc)
+    mock_exec = AsyncMock(return_value=_mock_proc())
     with patch("asyncio.create_subprocess_exec", mock_exec):
         await Transcoder(preset="slow").transcode(
             tmp_path / "in.mkv", tmp_path / "out.mkv"
@@ -100,11 +93,7 @@ async def test_transcode_uses_encoder_preset(tmp_path):
 
 @pytest.mark.asyncio
 async def test_transcode_uses_default_encoder_preset(tmp_path):
-    mock_proc = MagicMock()
-    mock_proc.stdout = _async_lines([])
-    mock_proc.wait = AsyncMock(return_value=0)
-
-    mock_exec = AsyncMock(return_value=mock_proc)
+    mock_exec = AsyncMock(return_value=_mock_proc())
     with patch("asyncio.create_subprocess_exec", mock_exec):
         await Transcoder().transcode(tmp_path / "in.mkv", tmp_path / "out.mkv")
 
@@ -118,16 +107,12 @@ async def test_transcode_clamps_progress_to_100(tmp_path):
     lines = [
         b"Encoding: task 1 of 1, 101.50 % (100.00 fps)\n",
     ]
-    mock_proc = MagicMock()
-    mock_proc.stdout = _async_lines(lines)
-    mock_proc.wait = AsyncMock(return_value=0)
-
     captured: list[int] = []
 
     async def on_progress(pct: int) -> None:
         captured.append(pct)
 
-    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=_mock_proc(stdout_lines=lines))):
         await Transcoder().transcode(
             tmp_path / "in.mkv", tmp_path / "out.mkv", on_progress=on_progress
         )

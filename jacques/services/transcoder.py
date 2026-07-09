@@ -47,9 +47,12 @@ class Transcoder:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         assert proc.stdout is not None
+        assert proc.stderr is not None
+
+        stderr_task = asyncio.create_task(proc.stderr.read())
 
         try:
             buf: list[str] = []
@@ -75,8 +78,12 @@ class Transcoder:
             if proc.returncode is None:
                 with contextlib.suppress(ProcessLookupError, OSError):
                     proc.kill()
-                await proc.wait()
+            await asyncio.gather(proc.wait(), stderr_task, return_exceptions=True)
 
-        returncode = await proc.wait()
-        if returncode != 0:
-            raise RuntimeError(f"HandBrakeCLI exited with code {returncode}")
+        if proc.returncode != 0:
+            stderr_out = ""
+            if stderr_task.done() and not stderr_task.cancelled():
+                with contextlib.suppress(Exception):
+                    stderr_out = stderr_task.result().decode(errors="replace").strip()
+            detail = f": {stderr_out}" if stderr_out else ""
+            raise RuntimeError(f"HandBrakeCLI exited with code {proc.returncode}{detail}")
