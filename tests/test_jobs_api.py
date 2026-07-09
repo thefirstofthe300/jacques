@@ -1,10 +1,11 @@
-"""Tests for POST /api/jobs/{job_id}/rerun/{stage}.
+"""Tests for POST /api/jobs/{job_id}/rerun/{stage} and POST /api/jobs/{job_id}/select/{tmdb_id}.
 
 Uses an in-memory SQLite DB (db_factory fixture), an httpx AsyncClient backed
 by the real FastAPI app, and a mock asyncio.Queue injected into app.state so
 we can assert enqueue behaviour without running the daemon.
 """
 import asyncio
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -13,6 +14,7 @@ from httpx import ASGITransport, AsyncClient
 from jacques.api.app import app
 from jacques.database import get_db
 from jacques.models.job import DiscType, Job, JobStatus
+from jacques.services.metadata import MediaInfo
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -24,16 +26,20 @@ async def _create_job(
     status: JobStatus = JobStatus.FAILED,
     drive_path: str = "/dev/sr0",
     disc_label: str | None = "TEST_DISC",
+    disc_type: DiscType = DiscType.UNKNOWN,
     progress: int = 50,
     error_message: str | None = "something went wrong",
+    candidates: str | None = None,
 ) -> int:
     async with db_factory() as db:
         job = Job(
             drive_path=drive_path,
             disc_label=disc_label,
+            disc_type=disc_type,
             status=status,
             progress=progress,
             error_message=error_message,
+            candidates=candidates,
         )
         db.add(job)
         await db.commit()
@@ -336,3 +342,112 @@ async def test_rerun_enqueues_exactly_one_item(api_client, db_factory, mock_queu
     await api_client.post(f"/api/jobs/{job_id}/rerun/fetching_metadata")
 
     assert mock_queue.qsize() == 1
+
+
+# ── select_match — direct TMDB ID lookup (no candidates) ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_select_match_direct_tmdb_id(api_client, db_factory, mock_queue):
+    """AWAITING_SELECTION job with candidates=None:
+    - MetadataService.lookup_by_id is called with the given tmdb_id and disc_type
+    - 202 response with job_id and tmdb_id
+    - DB: title/year/disc_type updated, candidates=None, status=TRANSCODING, progress=0
+    - Queue receives (job_id, JobStatus.TRANSCODING)
+    """
+    job_id = await _create_job(
+        db_factory,
+        status=JobStatus.AWAITING_SELECTION,
+        disc_type=DiscType.MOVIE,
+        candidates=None,
+        error_message=None,
+        progress=25,
+    )
+
+    fake_media = MediaInfo(
+        title="Inception",
+        year=2010,
+        disc_type=DiscType.MOVIE,
+        tmdb_id=27205,
+    )
+
+    with patch("jacques.api.routes.jobs.MetadataService") as mock_cls:
+        mock_cls.return_value.lookup_by_id = AsyncMock(return_value=fake_media)
+
+        response = await api_client.post(f"/api/jobs/{job_id}/select/27205")
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_id"] == job_id
+    assert body["tmdb_id"] == 27205
+
+    # Verify MetadataService was constructed and called correctly
+    mock_cls.assert_called_once()
+    mock_cls.return_value.lookup_by_id.assert_awaited_once_with(27205, DiscType.MOVIE)
+
+    job = await _get_job(db_factory, job_id)
+    assert job.title == "Inception"
+    assert job.year == 2010
+    assert job.disc_type == DiscType.MOVIE
+    assert job.tmdb_id == 27205
+    assert job.candidates is None
+    assert job.status == JobStatus.TRANSCODING
+    assert job.progress == 0
+
+    assert not mock_queue.empty()
+    enqueued = mock_queue.get_nowait()
+    assert enqueued == (job_id, JobStatus.TRANSCODING)
+
+
+@pytest.mark.asyncio
+async def test_select_match_direct_tmdb_id_not_found(api_client, db_factory):
+    """AWAITING_SELECTION job with candidates=None, but lookup_by_id raises ValueError:
+    - 404 response
+    - DB unchanged
+    """
+    job_id = await _create_job(
+        db_factory,
+        status=JobStatus.AWAITING_SELECTION,
+        disc_type=DiscType.MOVIE,
+        candidates=None,
+        error_message=None,
+        progress=0,
+    )
+
+    with patch("jacques.api.routes.jobs.MetadataService") as mock_cls:
+        mock_cls.return_value.lookup_by_id = AsyncMock(
+            side_effect=ValueError("TMDB ID 99999 not found")
+        )
+
+        response = await api_client.post(f"/api/jobs/{job_id}/select/99999")
+
+    assert response.status_code == 404
+    assert "99999" in response.json()["detail"]
+
+    # DB must be unchanged
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.AWAITING_SELECTION
+    assert job.title is None
+
+
+@pytest.mark.asyncio
+async def test_select_match_wrong_status_no_candidates(api_client, db_factory):
+    """Job with status=FAILED and candidates=None:
+    - Status guard fires before any MetadataService call
+    - 409 response
+    """
+    job_id = await _create_job(
+        db_factory,
+        status=JobStatus.FAILED,
+        disc_type=DiscType.MOVIE,
+        candidates=None,
+    )
+
+    with patch("jacques.api.routes.jobs.MetadataService") as mock_cls:
+        response = await api_client.post(f"/api/jobs/{job_id}/select/27205")
+
+        # MetadataService must never be touched
+        mock_cls.assert_not_called()
+
+    assert response.status_code == 409
+    assert "awaiting selection" in response.json()["detail"].lower()

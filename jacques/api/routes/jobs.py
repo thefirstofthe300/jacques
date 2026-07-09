@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ...config import settings
 from ...database import get_db
 from ...models.job import DiscType, Job, JobStatus
+from ...services.metadata import MetadataService
 
 _RERUN_ENTRY_STAGES: dict[str, JobStatus] = {
     "identifying": JobStatus.IDENTIFYING,
@@ -136,20 +137,32 @@ async def select_match(
         raise HTTPException(status_code=404, detail="Job not found")
 
     selectable = {JobStatus.AWAITING_SELECTION, JobStatus.RIPPING}
-    if job.status not in selectable or not job.candidates:
+    if job.status not in selectable:
         raise HTTPException(status_code=409, detail="Job is not awaiting selection")
 
-    candidates = json.loads(job.candidates)
-    candidate = next((c for c in candidates if c["tmdb_id"] == tmdb_id), None)
-    if candidate is None:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+    if job.candidates:
+        candidates = json.loads(job.candidates)
+        candidate = next((c for c in candidates if c["tmdb_id"] == tmdb_id), None)
+        if candidate is None:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+        title = candidate["title"]
+        year = candidate["year"]
+        disc_type = DiscType(candidate["disc_type"])
+    else:
+        try:
+            media_info = await MetadataService(settings.tmdb_api_key).lookup_by_id(tmdb_id, job.disc_type)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        title = media_info.title
+        year = media_info.year
+        disc_type = media_info.disc_type
 
     was_paused = job.status == JobStatus.AWAITING_SELECTION
 
-    job.title = candidate["title"]
-    job.year = candidate["year"]
+    job.title = title
+    job.year = year
     job.tmdb_id = tmdb_id
-    job.disc_type = DiscType(candidate["disc_type"])
+    job.disc_type = disc_type
     job.candidates = None
     job.error_message = None
     if was_paused:
