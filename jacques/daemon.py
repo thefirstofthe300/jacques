@@ -175,7 +175,21 @@ async def _run_pipeline(
             media_info = await metadata_svc.identify(
                 disc_label or "", disc_type_hint
             )
-            if media_info:
+            if isinstance(media_info, list):
+                candidates_json = json.dumps([
+                    {
+                        "tmdb_id": m.tmdb_id,
+                        "title": m.title,
+                        "year": m.year,
+                        "disc_type": m.disc_type.value,
+                        "overview": m.overview,
+                    }
+                    for m in media_info
+                ])
+                await _update_job(job_id, status=JobStatus.AWAITING_SELECTION, candidates=candidates_json)
+                log.info("Job %d: multiple matches found (%d), awaiting user selection", job_id, len(media_info))
+                return
+            elif isinstance(media_info, MediaInfo):
                 await _update_job(
                     job_id,
                     title=media_info.title,
