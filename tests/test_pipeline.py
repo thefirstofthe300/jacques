@@ -4,11 +4,17 @@ Each test uses an in-memory SQLite database and mocks external binaries
 (makemkvcon, HandBrakeCLI) and HTTP calls (TMDb). The file system is real
 (via pytest's tmp_path), so file creation and movement are tested end-to-end.
 """
+import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
 
+from jacques.api.app import app
+from jacques.database import get_db
 from jacques.models.job import DiscType, Job, JobStatus
 from jacques.services.metadata import MediaInfo
 from jacques.services.ripper import TitleInfo
@@ -284,6 +290,53 @@ async def test_pipeline_organizes_without_metadata(db_factory, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_pipeline_pauses_on_close_metadata_matches(db_factory, tmp_path):
+    """When metadata_svc.identify() returns a list of MediaInfo (close matches),
+    the pipeline should pause at AWAITING_SELECTION without starting ripping."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    movie_title = TitleInfo(0, "Main Feature", 7200, "title_t00.mkv", 24)
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=[movie_title])
+    mock_ripper.select_main_title = MagicMock(return_value=movie_title)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.rip = AsyncMock()
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = AsyncMock()
+
+    candidates = [
+        MediaInfo(title="The Matrix", year=1999, disc_type=DiscType.MOVIE, tmdb_id=603),
+        MediaInfo(title="The Matrix Reloaded", year=2003, disc_type=DiscType.MOVIE, tmdb_id=604),
+    ]
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=candidates)
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "THE_MATRIX")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "THE_MATRIX")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.AWAITING_SELECTION
+    assert job.candidates is not None
+
+    import json
+    parsed = json.loads(job.candidates)
+    assert len(parsed) == 2
+
+    mock_ripper.rip.assert_not_called()
+    mock_transcoder.transcode.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_pipeline_cleans_up_temp_dir_on_success(db_factory, tmp_path):
     from jacques import config, daemon
 
@@ -324,3 +377,152 @@ async def test_pipeline_cleans_up_temp_dir_on_success(db_factory, tmp_path):
 
     job_temp = config.settings.temp_path / str(job_id)
     assert not job_temp.exists()
+
+
+# ── select endpoint fixture ───────────────────────────────────────────────────
+
+
+@pytest_asyncio.fixture
+async def mock_queue():
+    return asyncio.Queue()
+
+
+@pytest_asyncio.fixture
+async def api_client(db_factory, mock_queue):
+    """AsyncClient wired to the FastAPI app with in-memory DB and mock queue."""
+    async def _override_get_db():
+        async with db_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    app.state.rerun_queue = mock_queue
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        yield client
+
+    app.dependency_overrides.clear()
+    if hasattr(app.state, "rerun_queue"):
+        del app.state.rerun_queue
+
+
+# ── select endpoint tests ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_select_endpoint_updates_job_and_enqueues_ripping(
+    db_factory, api_client, mock_queue
+):
+    """POST /api/jobs/{id}/select/{tmdb_id} on an AWAITING_SELECTION job should:
+    - return 202
+    - update title, year, tmdb_id, disc_type from the chosen candidate
+    - clear job.candidates
+    - set status to RIPPING
+    - enqueue (job_id, JobStatus.RIPPING) on the rerun_queue
+    """
+    candidates = [
+        {
+            "tmdb_id": 603,
+            "title": "The Matrix",
+            "year": 1999,
+            "disc_type": DiscType.MOVIE.value,
+            "overview": "A computer hacker learns the truth.",
+        },
+        {
+            "tmdb_id": 604,
+            "title": "The Matrix Reloaded",
+            "year": 2003,
+            "disc_type": DiscType.MOVIE.value,
+            "overview": "Neo and the rebel leaders.",
+        },
+    ]
+    async with db_factory() as db:
+        job = Job(
+            drive_path="/dev/sr0",
+            disc_label="THE_MATRIX",
+            status=JobStatus.AWAITING_SELECTION,
+            candidates=json.dumps(candidates),
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+        job_id = job.id
+
+    response = await api_client.post(f"/api/jobs/{job_id}/select/603")
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_id"] == job_id
+    assert body["tmdb_id"] == 603
+
+    async with db_factory() as db:
+        updated = await db.get(Job, job_id)
+
+    assert updated.status == JobStatus.RIPPING
+    assert updated.title == "The Matrix"
+    assert updated.year == 1999
+    assert updated.tmdb_id == 603
+    assert updated.disc_type == DiscType.MOVIE
+    assert updated.candidates is None
+    assert updated.progress == 0
+    assert updated.error_message is None
+
+    assert not mock_queue.empty()
+    enqueued = mock_queue.get_nowait()
+    assert enqueued == (job_id, JobStatus.RIPPING)
+
+
+@pytest.mark.asyncio
+async def test_select_endpoint_404_job_not_found(api_client):
+    response = await api_client.post("/api/jobs/99999/select/603")
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_select_endpoint_409_wrong_status(db_factory, api_client):
+    """Job not in AWAITING_SELECTION should return 409."""
+    async with db_factory() as db:
+        job = Job(
+            drive_path="/dev/sr0",
+            disc_label="SOME_DISC",
+            status=JobStatus.FAILED,
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+        job_id = job.id
+
+    response = await api_client.post(f"/api/jobs/{job_id}/select/603")
+    assert response.status_code == 409
+    assert "awaiting" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_select_endpoint_404_candidate_not_found(db_factory, api_client):
+    """Selecting a tmdb_id not in candidates should return 404."""
+    candidates = [
+        {
+            "tmdb_id": 603,
+            "title": "The Matrix",
+            "year": 1999,
+            "disc_type": DiscType.MOVIE.value,
+            "overview": "",
+        },
+    ]
+    async with db_factory() as db:
+        job = Job(
+            drive_path="/dev/sr0",
+            disc_label="THE_MATRIX",
+            status=JobStatus.AWAITING_SELECTION,
+            candidates=json.dumps(candidates),
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+        job_id = job.id
+
+    response = await api_client.post(f"/api/jobs/{job_id}/select/9999")
+    assert response.status_code == 404
+    assert "candidate" in response.json()["detail"].lower()
