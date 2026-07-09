@@ -292,18 +292,24 @@ async def test_pipeline_organizes_without_metadata(db_factory, tmp_path):
 @pytest.mark.asyncio
 async def test_pipeline_pauses_on_close_metadata_matches(db_factory, tmp_path):
     """When metadata_svc.identify() returns a list of MediaInfo (close matches),
-    the pipeline should pause at AWAITING_SELECTION without starting ripping."""
+    the pipeline rips the disc then pauses at AWAITING_SELECTION before transcoding."""
     from jacques import config, daemon
 
     _apply_settings(config.settings, tmp_path)
 
     movie_title = TitleInfo(0, "Main Feature", 7200, "title_t00.mkv", 24)
 
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / "title_t00.mkv"
+        mkv.write_bytes(b"fake raw mkv")
+        return mkv
+
     mock_ripper = MagicMock()
     mock_ripper.get_disc_info = AsyncMock(return_value=[movie_title])
     mock_ripper.select_main_title = MagicMock(return_value=movie_title)
     mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
-    mock_ripper.rip = AsyncMock()
+    mock_ripper.rip = fake_rip
 
     mock_transcoder = MagicMock()
     mock_transcoder.transcode = AsyncMock()
@@ -332,7 +338,7 @@ async def test_pipeline_pauses_on_close_metadata_matches(db_factory, tmp_path):
     parsed = json.loads(job.candidates)
     assert len(parsed) == 2
 
-    mock_ripper.rip.assert_not_called()
+    # Ripping ran, transcoding did not.
     mock_transcoder.transcode.assert_not_called()
 
 
@@ -459,7 +465,7 @@ async def test_select_endpoint_updates_job_and_enqueues_ripping(
     async with db_factory() as db:
         updated = await db.get(Job, job_id)
 
-    assert updated.status == JobStatus.RIPPING
+    assert updated.status == JobStatus.TRANSCODING
     assert updated.title == "The Matrix"
     assert updated.year == 1999
     assert updated.tmdb_id == 603
@@ -470,7 +476,7 @@ async def test_select_endpoint_updates_job_and_enqueues_ripping(
 
     assert not mock_queue.empty()
     enqueued = mock_queue.get_nowait()
-    assert enqueued == (job_id, JobStatus.RIPPING)
+    assert enqueued == (job_id, JobStatus.TRANSCODING)
 
 
 @pytest.mark.asyncio

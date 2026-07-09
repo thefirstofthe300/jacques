@@ -242,6 +242,7 @@
           ];
 
           shellHook = ''
+            export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
             echo "Jacques dev shell"
             printf "  uv:           %s\n" "$(uv --version 2>/dev/null || echo 'not found')"
             printf "  makemkvcon:   %s\n" "$(command -v makemkvcon  2>/dev/null || echo 'not found')"
