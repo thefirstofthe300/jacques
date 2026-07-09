@@ -1,3 +1,5 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -120,3 +122,40 @@ async def rerun_job(
     await queue.put((job_id, target_status))
 
     return JSONResponse(status_code=202, content={"job_id": job_id, "stage": stage})
+
+
+@router.post("/{job_id}/select/{tmdb_id}", status_code=202)
+async def select_match(
+    job_id: int,
+    tmdb_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    job = await db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status != JobStatus.AWAITING_SELECTION:
+        raise HTTPException(status_code=409, detail="Job is not awaiting selection")
+
+    candidates = json.loads(job.candidates)
+    candidate = next((c for c in candidates if c["tmdb_id"] == tmdb_id), None)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    job.title = candidate["title"]
+    job.year = candidate["year"]
+    job.tmdb_id = tmdb_id
+    job.disc_type = DiscType(candidate["disc_type"])
+    job.candidates = None
+    job.status = JobStatus.RIPPING
+    job.progress = 0
+    job.error_message = None
+    await db.commit()
+
+    queue = getattr(request.app.state, "rerun_queue", None)
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    await queue.put((job_id, JobStatus.RIPPING))
+
+    return JSONResponse(status_code=202, content={"job_id": job_id, "tmdb_id": tmdb_id})
