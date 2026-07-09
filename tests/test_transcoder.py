@@ -14,9 +14,15 @@ async def _async_lines(lines: list[bytes]):
 @pytest.mark.asyncio
 async def test_transcode_parses_progress(tmp_path):
     lines = [
-        b"Encoding: task 1 of 1, 25.00 % (100.00 fps, avg 105.00 fps, ETA 00h10m00s)\n",
-        b"Encoding: task 1 of 1, 75.00 % (110.00 fps, avg 108.00 fps, ETA 00h03m00s)\n",
-        b"Encoding: task 1 of 1, 100.00 % (115.00 fps, avg 109.00 fps, ETA 00h00m00s)\n",
+        b'Progress: {\n',
+        b'"State": "WORKING", "Working": {"Progress": 0.25}\n',
+        b'}\n',
+        b'Progress: {\n',
+        b'"State": "WORKING", "Working": {"Progress": 0.75}\n',
+        b'}\n',
+        b'Progress: {\n',
+        b'"State": "WORKING", "Working": {"Progress": 1.0}\n',
+        b'}\n',
     ]
     mock_proc = MagicMock()
     mock_proc.stdout = _async_lines(lines)

@@ -50,7 +50,7 @@ async def test_pipeline_movie_reaches_complete(db_factory, tmp_path):
 
     movie_title = TitleInfo(0, "Main Feature", 7200, "title_t00.mkv", 24)
 
-    async def fake_rip(title_id, output_dir, on_progress=None):
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
         output_dir.mkdir(parents=True, exist_ok=True)
         mkv = output_dir / "title_t00.mkv"
         mkv.write_bytes(b"fake raw mkv")
@@ -113,7 +113,7 @@ async def test_pipeline_tv_rips_multiple_titles(db_factory, tmp_path):
         TitleInfo(1, "Episode 2", 2640, "t01.mkv", 4),
     ]
 
-    async def fake_rip(title_id, output_dir, on_progress=None):
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
         output_dir.mkdir(parents=True, exist_ok=True)
         mkv = output_dir / f"t{title_id:02d}.mkv"
         mkv.write_bytes(b"raw episode")
@@ -208,7 +208,7 @@ async def test_pipeline_marks_failed_on_transcode_error(db_factory, tmp_path):
 
     movie_title = TitleInfo(0, "Film", 7200, "t00.mkv", 1)
 
-    async def fake_rip(title_id, output_dir, on_progress=None):
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
         output_dir.mkdir(parents=True, exist_ok=True)
         mkv = output_dir / "t00.mkv"
         mkv.write_bytes(b"raw")
@@ -245,7 +245,7 @@ async def test_pipeline_organizes_without_metadata(db_factory, tmp_path):
 
     movie_title = TitleInfo(0, "Feature", 7200, "t00.mkv", 1)
 
-    async def fake_rip(title_id, output_dir, on_progress=None):
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
         output_dir.mkdir(parents=True, exist_ok=True)
         mkv = output_dir / "t00.mkv"
         mkv.write_bytes(b"raw")
@@ -291,7 +291,7 @@ async def test_pipeline_cleans_up_temp_dir_on_success(db_factory, tmp_path):
 
     movie_title = TitleInfo(0, "Film", 7200, "t00.mkv", 1)
 
-    async def fake_rip(title_id, output_dir, on_progress=None):
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
         output_dir.mkdir(parents=True, exist_ok=True)
         mkv = output_dir / "t00.mkv"
         mkv.write_bytes(b"raw")

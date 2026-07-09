@@ -75,6 +75,8 @@ async def api_client(db_factory, mock_queue):
         yield client
 
     app.dependency_overrides.clear()
+    if hasattr(app.state, "rerun_queue"):
+        del app.state.rerun_queue
 
 
 # ── 404 — job not found ───────────────────────────────────────────────────────
