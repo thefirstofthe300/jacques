@@ -119,6 +119,7 @@ async def _run_pipeline(
     resume_raw: list[Path] = []
     resume_transcoded: list[Path] = []
     prior_job_id: int | None = None
+    candidates_stored: bool = False
 
     if not _should_run(JobStatus.IDENTIFYING, start_stage):
         async with AsyncSessionLocal() as db:
@@ -187,6 +188,7 @@ async def _run_pipeline(
                     for m in media_info
                 ])
                 await _update_job(job_id, candidates=candidates_json)
+                candidates_stored = True
                 log.info("Job %d: multiple matches found (%d), ripping now — awaiting user selection before transcode", job_id, len(media_info))
             elif isinstance(media_info, MediaInfo):
                 await _update_job(
@@ -224,9 +226,7 @@ async def _run_pipeline(
 
         # Pause before transcoding if user hasn't selected a match yet.
         if _should_run(JobStatus.RIPPING, start_stage):
-            async with AsyncSessionLocal() as db:
-                job = await db.get(Job, job_id)
-            if job is not None and job.candidates is not None:
+            if candidates_stored:
                 await _update_job(job_id, status=JobStatus.AWAITING_SELECTION)
                 log.info("Job %d: ripping complete, awaiting metadata selection before transcode", job_id)
                 return

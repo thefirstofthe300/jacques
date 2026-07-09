@@ -422,7 +422,7 @@ async def test_select_match_direct_tmdb_id_not_found(api_client, db_factory):
         response = await api_client.post(f"/api/jobs/{job_id}/select/99999")
 
     assert response.status_code == 404
-    assert "99999" in response.json()["detail"]
+    assert response.json()["detail"] == "TMDB ID not found"
 
     # DB must be unchanged
     job = await _get_job(db_factory, job_id)
@@ -451,3 +451,68 @@ async def test_select_match_wrong_status_no_candidates(api_client, db_factory):
 
     assert response.status_code == 409
     assert "awaiting selection" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_select_match_409_ripping_status(api_client, db_factory):
+    """Job with status=RIPPING: select_match only accepts AWAITING_SELECTION, so
+    a RIPPING job must be rejected with 409."""
+    job_id = await _create_job(
+        db_factory,
+        status=JobStatus.RIPPING,
+        disc_type=DiscType.MOVIE,
+        candidates='[{"tmdb_id": 550, "title": "Fight Club", "year": 1999, "disc_type": "movie", "overview": ""}]',
+        error_message=None,
+    )
+
+    with patch("jacques.api.routes.jobs.MetadataService") as mock_cls:
+        response = await api_client.post(f"/api/jobs/{job_id}/select/550")
+
+        # MetadataService must never be touched
+        mock_cls.assert_not_called()
+
+    assert response.status_code == 409
+    assert "awaiting selection" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_select_match_503_no_rerun_queue(db_factory):
+    """If rerun_queue is absent from app.state, the select endpoint returns 503
+    rather than raising an AttributeError."""
+    async def _override_get_db():
+        async with db_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    if hasattr(app.state, "rerun_queue"):
+        del app.state.rerun_queue
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            job_id = await _create_job(
+                db_factory,
+                status=JobStatus.AWAITING_SELECTION,
+                disc_type=DiscType.MOVIE,
+                candidates='[{"tmdb_id": 550, "title": "Fight Club", "year": 1999, "disc_type": "movie", "overview": ""}]',
+                error_message=None,
+            )
+
+            fake_media = MediaInfo(
+                title="Fight Club",
+                year=1999,
+                disc_type=DiscType.MOVIE,
+                tmdb_id=550,
+            )
+
+            with patch("jacques.api.routes.jobs.MetadataService") as mock_cls:
+                mock_cls.return_value.lookup_by_id = AsyncMock(return_value=fake_media)
+                response = await client.post(f"/api/jobs/{job_id}/select/550")
+
+        assert response.status_code == 503
+        assert "not ready" in response.json()["detail"].lower()
+    finally:
+        app.dependency_overrides.clear()
+        if hasattr(app.state, "rerun_queue"):
+            del app.state.rerun_queue

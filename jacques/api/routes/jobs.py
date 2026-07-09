@@ -1,4 +1,5 @@
 import json
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -17,6 +18,8 @@ _RERUN_ENTRY_STAGES: dict[str, JobStatus] = {
     "transcoding": JobStatus.TRANSCODING,
     "organizing": JobStatus.ORGANIZING,
 }
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
@@ -136,7 +139,7 @@ async def select_match(
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    selectable = {JobStatus.AWAITING_SELECTION, JobStatus.RIPPING}
+    selectable = {JobStatus.AWAITING_SELECTION}
     if job.status not in selectable:
         raise HTTPException(status_code=409, detail="Job is not awaiting selection")
 
@@ -152,7 +155,8 @@ async def select_match(
         try:
             media_info = await MetadataService(settings.tmdb_api_key).lookup_by_id(tmdb_id, job.disc_type)
         except ValueError as e:
-            raise HTTPException(status_code=404, detail=str(e))
+            log.warning("TMDB lookup failed for job %d, tmdb_id %d: %s", job_id, tmdb_id, e)
+            raise HTTPException(status_code=404, detail="TMDB ID not found")
         title = media_info.title
         year = media_info.year
         disc_type = media_info.disc_type
