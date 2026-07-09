@@ -186,9 +186,8 @@ async def _run_pipeline(
                     }
                     for m in media_info
                 ])
-                await _update_job(job_id, status=JobStatus.AWAITING_SELECTION, candidates=candidates_json)
-                log.info("Job %d: multiple matches found (%d), awaiting user selection", job_id, len(media_info))
-                return
+                await _update_job(job_id, candidates=candidates_json)
+                log.info("Job %d: multiple matches found (%d), ripping now — awaiting user selection before transcode", job_id, len(media_info))
             elif isinstance(media_info, MediaInfo):
                 await _update_job(
                     job_id,
@@ -222,6 +221,15 @@ async def _run_pipeline(
                     )
                     raw_paths.append(path)
                 (raw_dir / ".done").touch()
+
+        # Pause before transcoding if user hasn't selected a match yet.
+        if _should_run(JobStatus.RIPPING, start_stage):
+            async with AsyncSessionLocal() as db:
+                job = await db.get(Job, job_id)
+            if job is not None and job.candidates is not None:
+                await _update_job(job_id, status=JobStatus.AWAITING_SELECTION)
+                log.info("Job %d: ripping complete, awaiting metadata selection before transcode", job_id)
+                return
 
         # ── TRANSCODING (skipped if resuming from transcoded output) ───────────
         if _should_run(JobStatus.TRANSCODING, start_stage):

@@ -135,7 +135,8 @@ async def select_match(
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    if job.status != JobStatus.AWAITING_SELECTION:
+    selectable = {JobStatus.AWAITING_SELECTION, JobStatus.RIPPING}
+    if job.status not in selectable or not job.candidates:
         raise HTTPException(status_code=409, detail="Job is not awaiting selection")
 
     candidates = json.loads(job.candidates)
@@ -143,19 +144,23 @@ async def select_match(
     if candidate is None:
         raise HTTPException(status_code=404, detail="Candidate not found")
 
+    was_paused = job.status == JobStatus.AWAITING_SELECTION
+
     job.title = candidate["title"]
     job.year = candidate["year"]
     job.tmdb_id = tmdb_id
     job.disc_type = DiscType(candidate["disc_type"])
     job.candidates = None
-    job.status = JobStatus.RIPPING
-    job.progress = 0
     job.error_message = None
+    if was_paused:
+        job.status = JobStatus.TRANSCODING
+        job.progress = 0
     await db.commit()
 
-    queue = getattr(request.app.state, "rerun_queue", None)
-    if queue is None:
-        raise HTTPException(status_code=503, detail="Service not ready")
-    await queue.put((job_id, JobStatus.RIPPING))
+    if was_paused:
+        queue = getattr(request.app.state, "rerun_queue", None)
+        if queue is None:
+            raise HTTPException(status_code=503, detail="Service not ready")
+        await queue.put((job_id, JobStatus.TRANSCODING))
 
     return JSONResponse(status_code=202, content={"job_id": job_id, "tmdb_id": tmdb_id})
