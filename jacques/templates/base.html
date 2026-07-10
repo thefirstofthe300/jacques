@@ -74,23 +74,30 @@
     htmx.ajax('POST', '/api/jobs/' + jobId + '/select/' + tmdbId + discType, {swap: 'none'});
   }
 
-  // Preserve input values across job-list innerHTML swaps.
-  // HTMX fires beforeSwap and afterSwap synchronously in the same JS task,
-  // so the browser never renders the intermediate empty-field state.
+  // Preserve input values and dynamically-loaded candidate lists across
+  // job-list innerHTML swaps. HTMX fires beforeSwap and afterSwap synchronously
+  // in the same JS task, so the browser never renders the intermediate state.
   (function () {
     var saved = null;
     document.addEventListener('htmx:beforeSwap', function (e) {
       if (!e.detail.target || e.detail.target.id !== 'job-list') return;
-      saved = {};
+      saved = { values: {}, candidates: {} };
       e.detail.target.querySelectorAll('input[id], select[id]').forEach(function (el) {
-        if (el.value !== '') saved[el.id] = el.value;
+        if (el.value !== '') saved.values[el.id] = el.value;
+      });
+      e.detail.target.querySelectorAll('[id^="candidates-"]').forEach(function (el) {
+        if (el.innerHTML.trim() !== '') saved.candidates[el.id] = el.innerHTML;
       });
     });
     document.addEventListener('htmx:afterSwap', function (e) {
       if (!e.detail.target || e.detail.target.id !== 'job-list' || !saved) return;
-      Object.keys(saved).forEach(function (id) {
+      Object.keys(saved.values).forEach(function (id) {
         var el = document.getElementById(id);
-        if (el) el.value = saved[id];
+        if (el) el.value = saved.values[id];
+      });
+      Object.keys(saved.candidates).forEach(function (id) {
+        var el = document.getElementById(id);
+        if (el) { el.innerHTML = saved.candidates[id]; htmx.process(el); }
       });
       saved = null;
     });
