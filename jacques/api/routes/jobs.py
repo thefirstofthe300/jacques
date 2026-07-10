@@ -1,3 +1,6 @@
+import json
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -7,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ...config import settings
 from ...database import get_db
 from ...models.job import DiscType, Job, JobStatus
+from ...services.metadata import MetadataService
 
 _RERUN_ENTRY_STAGES: dict[str, JobStatus] = {
     "identifying": JobStatus.IDENTIFYING,
@@ -14,6 +18,8 @@ _RERUN_ENTRY_STAGES: dict[str, JobStatus] = {
     "transcoding": JobStatus.TRANSCODING,
     "organizing": JobStatus.ORGANIZING,
 }
+
+log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
@@ -120,3 +126,59 @@ async def rerun_job(
     await queue.put((job_id, target_status))
 
     return JSONResponse(status_code=202, content={"job_id": job_id, "stage": stage})
+
+
+@router.post("/{job_id}/select/{tmdb_id}", status_code=202)
+async def select_match(
+    job_id: int,
+    tmdb_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    job = await db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    selectable = {JobStatus.AWAITING_SELECTION}
+    if job.status not in selectable:
+        raise HTTPException(status_code=409, detail="Job is not awaiting selection")
+
+    candidate: dict | None = None
+    if job.candidates:
+        stored = json.loads(job.candidates)
+        candidate = next((c for c in stored if c["tmdb_id"] == tmdb_id), None)
+
+    if candidate is not None:
+        title = candidate["title"]
+        year = candidate["year"]
+        disc_type = DiscType(candidate["disc_type"])
+    else:
+        try:
+            media_info = await MetadataService(settings.tmdb_api_key).lookup_by_id(tmdb_id, job.disc_type)
+        except ValueError as e:
+            log.warning("TMDB lookup failed for job %d, tmdb_id %d: %s", job_id, tmdb_id, e)
+            raise HTTPException(status_code=404, detail="TMDB ID not found")
+        title = media_info.title
+        year = media_info.year
+        disc_type = media_info.disc_type
+
+    was_paused = job.status == JobStatus.AWAITING_SELECTION
+
+    job.title = title
+    job.year = year
+    job.tmdb_id = tmdb_id
+    job.disc_type = disc_type
+    job.candidates = None
+    job.error_message = None
+    if was_paused:
+        job.status = JobStatus.TRANSCODING
+        job.progress = 0
+    await db.commit()
+
+    if was_paused:
+        queue = getattr(request.app.state, "rerun_queue", None)
+        if queue is None:
+            raise HTTPException(status_code=503, detail="Service not ready")
+        await queue.put((job_id, JobStatus.TRANSCODING))
+
+    return JSONResponse(status_code=202, content={"job_id": job_id, "tmdb_id": tmdb_id})

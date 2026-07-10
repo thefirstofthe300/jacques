@@ -1,4 +1,6 @@
 import asyncio
+import dataclasses
+import json
 import logging
 import shutil
 from pathlib import Path
@@ -14,7 +16,7 @@ from .models.job import DiscType, Job, JobStatus
 from .services.detector import DiscDetector
 from .services.metadata import MediaInfo, MetadataService
 from .services.organizer import Organizer
-from .services.ripper import Ripper
+from .services.ripper import Ripper, TitleInfo
 from .services.transcoder import Transcoder
 
 log = logging.getLogger(__name__)
@@ -117,12 +119,20 @@ async def _run_pipeline(
     resume_raw: list[Path] = []
     resume_transcoded: list[Path] = []
     prior_job_id: int | None = None
+    candidates_stored: bool = False
 
     if not _should_run(JobStatus.IDENTIFYING, start_stage):
         async with AsyncSessionLocal() as db:
             job = await db.get(Job, job_id)
             if job is not None:
                 disc_type_hint = job.disc_type
+                if job.titles_json:
+                    all_titles = [TitleInfo(**t) for t in json.loads(job.titles_json)]
+                    titles_to_rip = (
+                        all_titles
+                        if disc_type_hint == DiscType.TV_SHOW
+                        else [ripper.select_main_title(all_titles)]
+                    )
                 if not _should_run(JobStatus.FETCHING_METADATA, start_stage) and job.title:
                     media_info = MediaInfo(
                         title=job.title,
@@ -150,7 +160,11 @@ async def _run_pipeline(
                 )
 
             disc_type_hint = DiscType.TV_SHOW if ripper.is_tv_show_hint(titles) else DiscType.MOVIE
-            await _update_job(job_id, disc_type=disc_type_hint)
+            await _update_job(
+                job_id,
+                disc_type=disc_type_hint,
+                titles_json=json.dumps([dataclasses.asdict(t) for t in titles]),
+            )
 
             titles_to_rip = titles if disc_type_hint == DiscType.TV_SHOW else [ripper.select_main_title(titles)]
 
@@ -162,7 +176,21 @@ async def _run_pipeline(
             media_info = await metadata_svc.identify(
                 disc_label or "", disc_type_hint
             )
-            if media_info:
+            if isinstance(media_info, list):
+                candidates_json = json.dumps([
+                    {
+                        "tmdb_id": m.tmdb_id,
+                        "title": m.title,
+                        "year": m.year,
+                        "disc_type": m.disc_type.value,
+                        "overview": m.overview,
+                    }
+                    for m in media_info
+                ])
+                await _update_job(job_id, candidates=candidates_json)
+                candidates_stored = True
+                log.info("Job %d: multiple matches found (%d), ripping now — awaiting user selection before transcode", job_id, len(media_info))
+            elif isinstance(media_info, MediaInfo):
                 await _update_job(
                     job_id,
                     title=media_info.title,
@@ -195,6 +223,13 @@ async def _run_pipeline(
                     )
                     raw_paths.append(path)
                 (raw_dir / ".done").touch()
+
+        # Pause before transcoding if user hasn't selected a match yet.
+        if _should_run(JobStatus.RIPPING, start_stage):
+            if candidates_stored:
+                await _update_job(job_id, status=JobStatus.AWAITING_SELECTION)
+                log.info("Job %d: ripping complete, awaiting metadata selection before transcode", job_id)
+                return
 
         # ── TRANSCODING (skipped if resuming from transcoded output) ───────────
         if _should_run(JobStatus.TRANSCODING, start_stage):
@@ -308,6 +343,21 @@ async def _process_jobs(queue: asyncio.Queue[tuple[str, str | None]]) -> None:
             queue.task_done()
 
 
+async def _reset_interrupted_jobs() -> int:
+    """Mark in-progress jobs failed on startup. AWAITING_SELECTION is preserved."""
+    # AWAITING_SELECTION is a deliberate user-action pause — it survives daemon restarts.
+    preserved = {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.AWAITING_SELECTION}
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Job).where(Job.status.not_in(preserved)))
+        interrupted = result.scalars().all()
+        for job in interrupted:
+            job.status = JobStatus.FAILED
+            job.error_message = "Interrupted by daemon restart"
+        if interrupted:
+            await db.commit()
+    return len(interrupted)
+
+
 async def run() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -320,16 +370,9 @@ async def run() -> None:
     await init_db()
     log.info("Database initialized at %s", settings.db_path)
 
-    terminal = {JobStatus.COMPLETE, JobStatus.FAILED}
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Job).where(Job.status.not_in(terminal)))
-        interrupted = result.scalars().all()
-        for job in interrupted:
-            job.status = JobStatus.FAILED
-            job.error_message = "Interrupted by daemon restart"
-        if interrupted:
-            await db.commit()
-            log.info("Marked %d interrupted job(s) as failed", len(interrupted))
+    count = await _reset_interrupted_jobs()
+    if count:
+        log.info("Marked %d interrupted job(s) as failed", count)
 
     job_queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
     rerun_queue: asyncio.Queue[tuple[int, JobStatus]] = asyncio.Queue()

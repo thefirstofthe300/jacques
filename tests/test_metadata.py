@@ -166,3 +166,164 @@ async def test_identify_handles_missing_release_date():
 
     assert result is not None
     assert result.year is None
+
+
+@pytest.mark.asyncio
+async def test_identify_returns_list_for_close_matches():
+    """Two results with popularity 100 and 50 (ratio 2×, below 3× threshold) → list."""
+    svc = MetadataService(api_key="testkey")
+
+    with respx.mock:
+        respx.get(f"{_BASE}/search/movie").mock(
+            return_value=httpx.Response(200, json={
+                "results": [
+                    {"id": 1, "title": "Close A", "release_date": "2020-01-01", "popularity": 100.0},
+                    {"id": 2, "title": "Close B", "release_date": "2019-06-01", "popularity": 50.0},
+                ]
+            })
+        )
+        result = await svc.identify("Close Match", DiscType.MOVIE)
+
+    assert isinstance(result, list)
+    assert len(result) == 2
+
+
+@pytest.mark.asyncio
+async def test_identify_returns_single_for_clear_winner():
+    """Two results with popularity 300 and 50 (ratio 6×, above 3× threshold) → single MediaInfo."""
+    svc = MetadataService(api_key="testkey")
+
+    with respx.mock:
+        respx.get(f"{_BASE}/search/movie").mock(
+            return_value=httpx.Response(200, json={
+                "results": [
+                    {"id": 10, "title": "Clear Winner", "release_date": "2022-03-01", "popularity": 300.0},
+                    {"id": 11, "title": "Distant Second", "release_date": "2021-08-01", "popularity": 50.0},
+                ]
+            })
+        )
+        result = await svc.identify("Clear Winner", DiscType.MOVIE)
+
+    assert isinstance(result, MediaInfo)
+    assert result.tmdb_id == 10
+    assert result.title == "Clear Winner"
+
+
+@pytest.mark.asyncio
+async def test_identify_returns_single_for_zero_popularity_second():
+    """Second result has popularity 0 → guard triggers, returns single top MediaInfo."""
+    svc = MetadataService(api_key="testkey")
+
+    with respx.mock:
+        respx.get(f"{_BASE}/search/movie").mock(
+            return_value=httpx.Response(200, json={
+                "results": [
+                    {"id": 20, "title": "Top Result", "release_date": "2023-05-01", "popularity": 75.0},
+                    {"id": 21, "title": "Zero Pop", "release_date": "2022-11-01", "popularity": 0.0},
+                ]
+            })
+        )
+        result = await svc.identify("Top Result", DiscType.MOVIE)
+
+    assert isinstance(result, MediaInfo)
+    assert result.tmdb_id == 20
+
+
+@pytest.mark.asyncio
+async def test_identify_returns_single_for_exactly_one_result():
+    """Exactly one result → returns MediaInfo, not a list."""
+    svc = MetadataService(api_key="testkey")
+
+    with respx.mock:
+        respx.get(f"{_BASE}/search/movie").mock(
+            return_value=httpx.Response(200, json={
+                "results": [
+                    {"id": 30, "title": "Only Film", "release_date": "2024-01-01", "popularity": 42.0},
+                ]
+            })
+        )
+        result = await svc.identify("Only Film", DiscType.MOVIE)
+
+    assert isinstance(result, MediaInfo)
+    assert result.tmdb_id == 30
+
+
+# ---------------------------------------------------------------------------
+# lookup_by_id tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_lookup_by_id_movie():
+    svc = MetadataService(api_key="testkey")
+
+    with respx.mock:
+        respx.get(f"{_BASE}/movie/550").mock(
+            return_value=httpx.Response(200, json={
+                "title": "Fight Club",
+                "release_date": "1999-10-15",
+                "overview": "An insomniac office worker forms an underground fight club.",
+                "popularity": 50.0,
+            })
+        )
+        result = await svc.lookup_by_id(550, DiscType.MOVIE)
+
+    assert result.title == "Fight Club"
+    assert result.year == 1999
+    assert result.disc_type == DiscType.MOVIE
+    assert result.tmdb_id == 550
+    assert result.popularity == 50.0
+    assert "insomniac" in result.overview
+
+
+@pytest.mark.asyncio
+async def test_lookup_by_id_tv():
+    svc = MetadataService(api_key="testkey")
+
+    with respx.mock:
+        respx.get(f"{_BASE}/tv/1396").mock(
+            return_value=httpx.Response(200, json={
+                "name": "Breaking Bad",
+                "first_air_date": "2008-01-20",
+                "overview": "A chemistry teacher turns to cooking meth.",
+                "popularity": 100.0,
+            })
+        )
+        result = await svc.lookup_by_id(1396, DiscType.TV_SHOW)
+
+    assert result.title == "Breaking Bad"
+    assert result.year == 2008
+    assert result.disc_type == DiscType.TV_SHOW
+    assert result.tmdb_id == 1396
+    assert result.popularity == 100.0
+
+
+@pytest.mark.asyncio
+async def test_lookup_by_id_not_found():
+    svc = MetadataService(api_key="testkey")
+
+    with respx.mock:
+        respx.get(f"{_BASE}/movie/999999").mock(
+            return_value=httpx.Response(404, json={"status_message": "The resource you requested could not be found."})
+        )
+        with pytest.raises(ValueError, match="999999"):
+            await svc.lookup_by_id(999999, DiscType.MOVIE)
+
+
+@pytest.mark.asyncio
+async def test_lookup_by_id_unknown_disc_type_treated_as_movie():
+    svc = MetadataService(api_key="testkey")
+
+    with respx.mock:
+        respx.get(f"{_BASE}/movie/550").mock(
+            return_value=httpx.Response(200, json={
+                "title": "Fight Club",
+                "release_date": "1999-10-15",
+                "overview": "An insomniac office worker forms an underground fight club.",
+                "popularity": 50.0,
+            })
+        )
+        result = await svc.lookup_by_id(550, DiscType.UNKNOWN)
+
+    assert result.title == "Fight Club"
+    assert result.disc_type == DiscType.MOVIE
+    assert result.tmdb_id == 550

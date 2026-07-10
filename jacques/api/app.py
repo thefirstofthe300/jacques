@@ -23,6 +23,7 @@ _STATUS_CLASSES: dict[str, str] = {
     "transcoding": "bg-primary",
     "fetching_metadata": "bg-warning text-dark",
     "organizing": "bg-warning text-dark",
+    "awaiting_selection": "bg-warning text-dark",
     "complete": "bg-success",
     "failed": "bg-danger",
 }

@@ -15,9 +15,6 @@ result-*
 # Environment
 .env
 
-# RPM build artifacts
-packaging/rpm/build-staging/
-
 # Serena MCP memories (local AI notes, not repo content)
 .serena/memories/
 

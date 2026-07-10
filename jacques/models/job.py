@@ -16,6 +16,7 @@ class JobStatus(str, enum.Enum):
     ORGANIZING = "organizing"
     COMPLETE = "complete"
     FAILED = "failed"
+    AWAITING_SELECTION = "awaiting_selection"
 
 
 class DiscType(str, enum.Enum):
@@ -45,6 +46,8 @@ class Job(Base):
     tmdb_id: Mapped[int | None] = mapped_column(Integer)
     progress: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_message: Mapped[str | None] = mapped_column(String)
+    candidates: Mapped[str | None] = mapped_column(String)
+    titles_json: Mapped[str | None] = mapped_column(String)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False
     )
@@ -60,4 +63,15 @@ class Job(Base):
 
     @property
     def is_active(self) -> bool:
-        return self.status not in (JobStatus.COMPLETE, JobStatus.FAILED)
+        return self.status not in (
+            JobStatus.COMPLETE,
+            JobStatus.FAILED,
+            JobStatus.AWAITING_SELECTION,
+        )
+
+    @property
+    def parsed_candidates(self) -> list[dict]:
+        if not self.candidates:
+            return []
+        import json
+        return json.loads(self.candidates)
