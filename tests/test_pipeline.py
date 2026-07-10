@@ -14,6 +14,7 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from jacques.api.app import app
+from jacques.daemon import _reset_interrupted_jobs
 from jacques.database import get_db
 from jacques.models.job import DiscType, Job, JobStatus
 from jacques.services.metadata import MediaInfo
@@ -507,7 +508,8 @@ async def test_select_endpoint_409_wrong_status(db_factory, api_client):
 
 @pytest.mark.asyncio
 async def test_select_endpoint_404_candidate_not_found(db_factory, api_client):
-    """Selecting a tmdb_id not in candidates should return 404."""
+    """Selecting a tmdb_id not in candidates falls through to a direct TMDb lookup.
+    If the lookup also fails, the endpoint returns 404."""
     candidates = [
         {
             "tmdb_id": 603,
@@ -529,6 +531,39 @@ async def test_select_endpoint_404_candidate_not_found(db_factory, api_client):
         await db.refresh(job)
         job_id = job.id
 
-    response = await api_client.post(f"/api/jobs/{job_id}/select/9999")
+    with patch("jacques.api.routes.jobs.MetadataService") as mock_cls:
+        mock_cls.return_value.lookup_by_id = AsyncMock(
+            side_effect=ValueError("TMDB ID 9999 not found")
+        )
+        response = await api_client.post(f"/api/jobs/{job_id}/select/9999")
+
     assert response.status_code == 404
-    assert "candidate" in response.json()["detail"].lower()
+    assert response.json()["detail"] == "TMDB ID not found"
+
+
+@pytest.mark.asyncio
+async def test_reset_interrupted_jobs_preserves_awaiting_selection(db_factory):
+    """AWAITING_SELECTION jobs must survive a daemon restart; only truly in-progress
+    jobs (RIPPING, TRANSCODING, etc.) should be marked failed."""
+    async with db_factory() as db:
+        ripping_job = Job(drive_path="/dev/sr0", disc_label="A", status=JobStatus.RIPPING)
+        awaiting_job = Job(drive_path="/dev/sr1", disc_label="B", status=JobStatus.AWAITING_SELECTION, candidates="[]")
+        complete_job = Job(drive_path="/dev/sr2", disc_label="C", status=JobStatus.COMPLETE)
+        db.add_all([ripping_job, awaiting_job, complete_job])
+        await db.commit()
+        await db.refresh(ripping_job)
+        await db.refresh(awaiting_job)
+        ripping_id = ripping_job.id
+        awaiting_id = awaiting_job.id
+
+    with patch("jacques.daemon.AsyncSessionLocal", db_factory):
+        count = await _reset_interrupted_jobs()
+
+    assert count == 1
+
+    async with db_factory() as db:
+        ripping = await db.get(Job, ripping_id)
+        awaiting = await db.get(Job, awaiting_id)
+        assert ripping.status == JobStatus.FAILED
+        assert ripping.error_message == "Interrupted by daemon restart"
+        assert awaiting.status == JobStatus.AWAITING_SELECTION

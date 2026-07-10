@@ -516,3 +516,34 @@ async def test_select_match_503_no_rerun_queue(db_factory):
         app.dependency_overrides.clear()
         if hasattr(app.state, "rerun_queue"):
             del app.state.rerun_queue
+
+
+@pytest.mark.asyncio
+async def test_select_match_tmdb_id_not_in_candidates_falls_through(api_client, db_factory, mock_queue):
+    """When a job has stored candidates but the given TMDB ID is not among them,
+    the endpoint falls through to a direct TMDb lookup instead of returning 404."""
+    stored = '[{"tmdb_id": 550, "title": "Fight Club", "year": 1999, "disc_type": "movie", "overview": ""}]'
+    job_id = await _create_job(
+        db_factory,
+        status=JobStatus.AWAITING_SELECTION,
+        disc_type=DiscType.MOVIE,
+        candidates=stored,
+        error_message=None,
+        progress=0,
+    )
+
+    fake_media = MediaInfo(title="The Patriot", year=2000, disc_type=DiscType.MOVIE, tmdb_id=9659)
+
+    with patch("jacques.api.routes.jobs.MetadataService") as mock_cls:
+        mock_cls.return_value.lookup_by_id = AsyncMock(return_value=fake_media)
+        response = await api_client.post(f"/api/jobs/{job_id}/select/9659")
+
+    assert response.status_code == 202
+    mock_cls.return_value.lookup_by_id.assert_awaited_once_with(9659, DiscType.MOVIE)
+
+    job = await _get_job(db_factory, job_id)
+    assert job.title == "The Patriot"
+    assert job.year == 2000
+    assert job.tmdb_id == 9659
+    assert job.candidates is None
+    assert job.status == JobStatus.TRANSCODING
