@@ -243,6 +243,33 @@ async def _run_pipeline(
                 log.info("Job %d: ripping complete, awaiting metadata selection before transcode", job_id)
                 return
 
+        # Pause before transcoding if a multi-title disc still needs per-title
+        # episode assignment (TV) or a keep-this-one choice (movie). These read
+        # persisted state fresh from the DB (unlike candidates_stored above) so
+        # this re-evaluates correctly on every resume through TRANSCODING —
+        # including a resume triggered by the AWAITING_SELECTION flow above.
+        if _should_run(JobStatus.TRANSCODING, start_stage) and len(titles_to_rip) > 1:
+            async with AsyncSessionLocal() as db:
+                job = await db.get(Job, job_id)
+                pending_episode_assignment = (
+                    job is not None
+                    and disc_type_hint == DiscType.TV_SHOW
+                    and not job.episode_assignments
+                )
+                pending_title_selection = (
+                    job is not None
+                    and disc_type_hint == DiscType.MOVIE
+                    and job.selected_title_id is None
+                )
+            if pending_episode_assignment:
+                await _update_job(job_id, status=JobStatus.AWAITING_EPISODE_ASSIGNMENT)
+                log.info("Job %d: ripping complete, awaiting episode assignment before transcode", job_id)
+                return
+            if pending_title_selection:
+                await _update_job(job_id, status=JobStatus.AWAITING_TITLE_SELECTION)
+                log.info("Job %d: ripping complete, awaiting title selection before transcode", job_id)
+                return
+
         # ── TRANSCODING (skipped if resuming from transcoded output) ───────────
         if _should_run(JobStatus.TRANSCODING, start_stage):
             if resume_transcoded:

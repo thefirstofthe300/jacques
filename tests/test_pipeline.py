@@ -195,7 +195,21 @@ async def test_pipeline_ambiguous_movie_rips_all_candidates(db_factory, tmp_path
         patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
         patch("jacques.daemon.MetadataService", return_value=mock_metadata),
     ):
-        job_id = await _create_job(db_factory, "/dev/sr0", "AMBIGUOUS_MOVIE")
+        # Pre-populate selected_title_id so the ambiguous-movie pause (added for
+        # the multi-title workflow) doesn't intercept the run — this test is
+        # about the ripping stage, not the pause/resume behavior.
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="AMBIGUOUS_MOVIE",
+                status=JobStatus.DETECTED,
+                selected_title_id=0,
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
         await daemon._run_pipeline(job_id, "/dev/sr0", "AMBIGUOUS_MOVIE")
 
     job = await _get_job(db_factory, job_id)
@@ -250,7 +264,21 @@ async def test_pipeline_tv_rips_multiple_titles(db_factory, tmp_path):
         patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
         patch("jacques.daemon.MetadataService", return_value=mock_metadata),
     ):
-        job_id = await _create_job(db_factory, "/dev/sr0", "BREAKING_BAD_S1")
+        # Pre-populate episode_assignments so the episode-assignment pause (added
+        # for the multi-title workflow) doesn't intercept the run — this test is
+        # about the ripping/organizing stages, not the pause/resume behavior.
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="BREAKING_BAD_S1",
+                status=JobStatus.DETECTED,
+                episode_assignments=json.dumps({"0": 1, "1": 2}),
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
         await daemon._run_pipeline(job_id, "/dev/sr0", "BREAKING_BAD_S1")
 
     job = await _get_job(db_factory, job_id)
@@ -440,6 +468,369 @@ async def test_pipeline_pauses_on_close_metadata_matches(db_factory, tmp_path):
     mock_transcoder.transcode.assert_not_called()
 
 
+# ── episode assignment / title selection pause tests ───────────────────────────
+# Regression coverage for the pause block added right after the AWAITING_SELECTION
+# pause (daemon.py, gated on _should_run(JobStatus.TRANSCODING, start_stage) rather
+# than RIPPING) that holds multi-title TV/movie discs for episode assignment or
+# title selection before transcoding.
+
+
+@pytest.mark.asyncio
+async def test_pipeline_pauses_on_episode_assignment_tv_multi_title(db_factory, tmp_path):
+    """A TV disc with more than one title ripped, and no episode_assignments yet,
+    must pause at AWAITING_EPISODE_ASSIGNMENT before transcoding."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    episodes = [
+        TitleInfo(0, "Episode 1", 2700, "t00.mkv", 4),
+        TitleInfo(1, "Episode 2", 2640, "t01.mkv", 4),
+    ]
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(b"raw episode")
+        return mkv
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=episodes)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = AsyncMock()
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=MediaInfo(
+        title="Breaking Bad", year=2008, disc_type=DiscType.TV_SHOW, tmdb_id=1396
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "BREAKING_BAD_S1")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "BREAKING_BAD_S1")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.AWAITING_EPISODE_ASSIGNMENT
+    mock_transcoder.transcode.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_skips_episode_assignment_pause_when_already_assigned(db_factory, tmp_path):
+    """If episode_assignments is already populated (e.g. from a prior assignment
+    action), a multi-title TV disc should not pause and should transcode normally."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    episodes = [
+        TitleInfo(0, "Episode 1", 2700, "t00.mkv", 4),
+        TitleInfo(1, "Episode 2", 2640, "t01.mkv", 4),
+    ]
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(b"raw episode")
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"h265 episode")
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=episodes)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=MediaInfo(
+        title="Breaking Bad", year=2008, disc_type=DiscType.TV_SHOW, tmdb_id=1396
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="BREAKING_BAD_S1",
+                status=JobStatus.DETECTED,
+                episode_assignments=json.dumps({"0": 1, "1": 2}),
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
+        await daemon._run_pipeline(job_id, "/dev/sr0", "BREAKING_BAD_S1")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+
+    season_dir = tmp_path / "library" / "TV Shows" / "Breaking Bad (2008)" / "Season 01"
+    assert (season_dir / "Breaking Bad - S01E01.mkv").exists()
+    assert (season_dir / "Breaking Bad - S01E02.mkv").exists()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_pauses_on_title_selection_ambiguous_movie(db_factory, tmp_path):
+    """An ambiguous movie disc (multiple titles, none flagged main feature) with no
+    selected_title_id yet must pause at AWAITING_TITLE_SELECTION before transcoding."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    candidates = [
+        TitleInfo(0, "Title A", 7200, "t00.mkv", 1),
+        TitleInfo(1, "Title B", 6900, "t01.mkv", 1),
+    ]
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(f"raw-{title_id}".encode())
+        return mkv
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=candidates)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.has_ambiguous_main_feature = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = AsyncMock()
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=MediaInfo(
+        title="Ambiguous Movie", year=2020, disc_type=DiscType.MOVIE, tmdb_id=1
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "AMBIGUOUS_MOVIE")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "AMBIGUOUS_MOVIE")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.AWAITING_TITLE_SELECTION
+    mock_transcoder.transcode.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_skips_title_selection_pause_when_already_selected(db_factory, tmp_path):
+    """If selected_title_id is already set (e.g. from a prior selection action), an
+    ambiguous multi-title movie disc should not pause and should transcode normally."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    candidates = [
+        TitleInfo(0, "Title A", 7200, "t00.mkv", 1),
+        TitleInfo(1, "Title B", 6900, "t01.mkv", 1),
+    ]
+
+    transcode_calls: list[Path] = []
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(f"raw-{title_id}".encode())
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        transcode_calls.append(input_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(input_path.read_bytes())
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=candidates)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.has_ambiguous_main_feature = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=MediaInfo(
+        title="Ambiguous Movie", year=2020, disc_type=DiscType.MOVIE, tmdb_id=1
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="AMBIGUOUS_MOVIE",
+                status=JobStatus.DETECTED,
+                selected_title_id=0,
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
+        await daemon._run_pipeline(job_id, "/dev/sr0", "AMBIGUOUS_MOVIE")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    # Both ripped titles were transcoded — the pause did not short-circuit the run.
+    assert len(transcode_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_pipeline_single_title_tv_show_never_pauses_for_assignment(db_factory, tmp_path):
+    """A TV disc with only one ripped title must never hit the episode-assignment /
+    title-selection pause block (guarded on len(titles_to_rip) > 1) — it should
+    reach COMPLETE in one pass even though episode_assignments is never set."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    single_episode = [TitleInfo(0, "Episode 1", 2700, "t00.mkv", 4)]
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / "t00.mkv"
+        mkv.write_bytes(b"raw episode")
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"h265 episode")
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=single_episode)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=MediaInfo(
+        title="Single Ep Show", year=2019, disc_type=DiscType.TV_SHOW, tmdb_id=55
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "SINGLE_EP_SHOW")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "SINGLE_EP_SHOW")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    assert job.episode_assignments is None
+
+
+@pytest.mark.asyncio
+async def test_pipeline_pauses_on_episode_assignment_after_resuming_from_awaiting_selection(
+    db_factory, tmp_path
+):
+    """Critical regression test: a TV disc that ALSO has ambiguous TMDB metadata
+    must first pause at AWAITING_SELECTION (existing behavior), and — after that is
+    resolved by rerunning _run_pipeline with start_stage=TRANSCODING, exactly as the
+    select_match endpoint does — must then pause at AWAITING_EPISODE_ASSIGNMENT
+    rather than silently skipping straight through to transcode, because
+    episode_assignments is still None.
+
+    This specifically exercises why the new pause block is gated on
+    _should_run(JobStatus.TRANSCODING, start_stage) rather than
+    _should_run(JobStatus.RIPPING, start_stage): on the second call, RIPPING's
+    index is below TRANSCODING's, so _should_run(RIPPING, TRANSCODING) is False.
+    If the gate were regressed to check RIPPING, this block would never execute on
+    the resumed call and the job would fall through to a full, un-paused transcode
+    and reach COMPLETE — which is exactly what the assertions below would catch.
+    """
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    episodes = [
+        TitleInfo(0, "Episode 1", 2700, "t00.mkv", 4),
+        TitleInfo(1, "Episode 2", 2640, "t01.mkv", 4),
+    ]
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(b"raw episode")
+        return mkv
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=episodes)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = AsyncMock()
+
+    candidates = [
+        MediaInfo(title="Some Show", year=2010, disc_type=DiscType.TV_SHOW, tmdb_id=42),
+        MediaInfo(title="Some Other Show", year=2011, disc_type=DiscType.TV_SHOW, tmdb_id=43),
+    ]
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=candidates)
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "SOME_SHOW")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "SOME_SHOW")
+
+        # First pause: metadata ambiguity (existing AWAITING_SELECTION behavior).
+        job = await _get_job(db_factory, job_id)
+        assert job.status == JobStatus.AWAITING_SELECTION
+
+        # Simulate the select_match endpoint resolving the TMDB ambiguity: pick a
+        # candidate, clear candidates, set status to TRANSCODING — episode
+        # assignments are left untouched (still None), exactly as that endpoint
+        # does today (it has no notion of per-episode assignment).
+        async with db_factory() as db:
+            db_job = await db.get(Job, job_id)
+            db_job.title = "Some Show"
+            db_job.year = 2010
+            db_job.tmdb_id = 42
+            db_job.disc_type = DiscType.TV_SHOW
+            db_job.candidates = None
+            db_job.status = JobStatus.TRANSCODING
+            await db.commit()
+
+        await daemon._run_pipeline(
+            job_id, "/dev/sr0", "SOME_SHOW", start_stage=JobStatus.TRANSCODING
+        )
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.AWAITING_EPISODE_ASSIGNMENT
+    mock_transcoder.transcode.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_pipeline_cleans_up_temp_dir_on_success(db_factory, tmp_path):
     from jacques import config, daemon
@@ -541,7 +932,21 @@ async def test_pipeline_rips_titles_into_distinct_subdirectories(db_factory, tmp
         patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
         patch("jacques.daemon.MetadataService", return_value=mock_metadata),
     ):
-        job_id = await _create_job(db_factory, "/dev/sr0", "SOME_SHOW")
+        # Pre-populate episode_assignments so the episode-assignment pause (added
+        # for the multi-title workflow) doesn't intercept the run — this test is
+        # about per-title subdirectory isolation, not the pause/resume behavior.
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="SOME_SHOW",
+                status=JobStatus.DETECTED,
+                episode_assignments=json.dumps({"0": 1, "1": 2, "2": 3}),
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
         await daemon._run_pipeline(job_id, "/dev/sr0", "SOME_SHOW")
 
     job = await _get_job(db_factory, job_id)
@@ -612,7 +1017,21 @@ async def test_pipeline_title_attribution_survives_largest_file_selection(db_fac
         patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
         patch("jacques.daemon.MetadataService", return_value=mock_metadata),
     ):
-        job_id = await _create_job(db_factory, "/dev/sr0", "REGRESSION_SHOW")
+        # Pre-populate episode_assignments so the episode-assignment pause (added
+        # for the multi-title workflow) doesn't intercept the run — this test is
+        # about title-attribution correctness, not the pause/resume behavior.
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="REGRESSION_SHOW",
+                status=JobStatus.DETECTED,
+                episode_assignments=json.dumps({"0": 1, "1": 2}),
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
         await daemon._run_pipeline(job_id, "/dev/sr0", "REGRESSION_SHOW")
 
     job = await _get_job(db_factory, job_id)
