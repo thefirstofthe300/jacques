@@ -138,15 +138,3 @@
     <p class="text-muted small">Insert a disc to get started.</p>
   </div>
 {% endif %}
-
-<script>
-function submitTmdbId(jobId) {
-  const input = document.getElementById('tmdb-id-' + jobId);
-  const tmdbId = parseInt(input.value, 10);
-  if (!tmdbId || tmdbId < 1) {
-    alert('Please enter a valid TMDB ID');
-    return;
-  }
-  htmx.ajax('POST', '/api/jobs/' + jobId + '/select/' + tmdbId, {swap: 'none'});
-}
-</script>
