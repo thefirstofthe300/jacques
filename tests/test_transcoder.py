@@ -118,3 +118,22 @@ async def test_transcode_clamps_progress_to_100(tmp_path):
         )
 
     assert all(p <= 100 for p in captured)
+
+
+@pytest.mark.asyncio
+async def test_transcode_treats_255_with_encode_done_as_success(tmp_path):
+    # HandBrakeCLI 1.10.2 exits 255 even on success on some Linux packaging setups.
+    stderr = b"x265 [info]: ...\nEncode done!\nHandBrake has exited."
+    mock_proc = _mock_proc(returncode=255, stderr_data=stderr)
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+        await Transcoder().transcode(tmp_path / "in.mkv", tmp_path / "out.mkv")
+
+
+@pytest.mark.asyncio
+async def test_transcode_raises_on_255_without_encode_done(tmp_path):
+    mock_proc = _mock_proc(returncode=255, stderr_data=b"Error: cannot open source file")
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+        with pytest.raises(RuntimeError, match="HandBrakeCLI exited with code 255"):
+            await Transcoder().transcode(tmp_path / "in.mkv", tmp_path / "out.mkv")
