@@ -65,15 +65,15 @@ async def _find_resumable_paths(
         prior_temp = settings.temp_path / str(prior_id)
 
         transcoded_dir = prior_temp / "transcoded"
-        transcoded = sorted(transcoded_dir.glob("*.mkv"), key=lambda p: p.stat().st_size, reverse=True) if (transcoded_dir.exists() and (transcoded_dir / ".done").exists()) else []
+        transcoded = sorted(transcoded_dir.glob("*/*.mkv"), key=lambda p: int(p.parent.name)) if (transcoded_dir.exists() and (transcoded_dir / ".done").exists()) else []
         if transcoded:
             raw_dir = prior_temp / "raw"
-            raw = sorted(raw_dir.glob("*.mkv"), key=lambda p: p.stat().st_size, reverse=True) if raw_dir.exists() else []
+            raw = sorted(raw_dir.glob("*/*.mkv"), key=lambda p: int(p.parent.name)) if raw_dir.exists() else []
             log.info("Job %d: found resumable transcoded output from job %d", exclude_job_id, prior_id)
             return raw, transcoded, prior_id
 
         raw_dir = prior_temp / "raw"
-        raw = sorted(raw_dir.glob("*.mkv"), key=lambda p: p.stat().st_size, reverse=True) if (raw_dir.exists() and (raw_dir / ".done").exists()) else []
+        raw = sorted(raw_dir.glob("*/*.mkv"), key=lambda p: int(p.parent.name)) if (raw_dir.exists() and (raw_dir / ".done").exists()) else []
         if raw:
             log.info("Job %d: found resumable raw output from job %d", exclude_job_id, prior_id)
             return raw, [], prior_id
@@ -144,10 +144,10 @@ async def _run_pipeline(
                     )
 
     if not _should_run(JobStatus.RIPPING, start_stage):
-        raw_paths = sorted(raw_dir.glob("*.mkv"), key=lambda p: p.stat().st_size, reverse=True) if (raw_dir.exists() and (raw_dir / ".done").exists()) else []
+        raw_paths = sorted(raw_dir.glob("*/*.mkv"), key=lambda p: int(p.parent.name)) if (raw_dir.exists() and (raw_dir / ".done").exists()) else []
 
     if not _should_run(JobStatus.TRANSCODING, start_stage):
-        transcoded_paths = sorted(transcoded_dir.glob("*.mkv"), key=lambda p: p.stat().st_size, reverse=True) if (transcoded_dir.exists() and (transcoded_dir / ".done").exists()) else []
+        transcoded_paths = sorted(transcoded_dir.glob("*/*.mkv"), key=lambda p: int(p.parent.name)) if (transcoded_dir.exists() and (transcoded_dir / ".done").exists()) else []
 
     try:
         # ── IDENTIFYING ────────────────────────────────────────────────────────
@@ -219,7 +219,7 @@ async def _run_pipeline(
                 for i, title in enumerate(titles_to_rip):
                     path = await ripper.rip(
                         title.id,
-                        raw_dir,
+                        raw_dir / str(title.id),
                         on_progress=_stage_progress(job_id, i, len(titles_to_rip)),
                         expected_bytes=title.expected_bytes,
                     )
@@ -243,7 +243,7 @@ async def _run_pipeline(
                 log.info("Job %d: transcoding %d file(s)", job_id, len(raw_paths))
                 transcoded_paths = []
                 for i, raw_path in enumerate(raw_paths):
-                    out = transcoded_dir / raw_path.name
+                    out = transcoded_dir / raw_path.parent.name / raw_path.name
                     await transcoder.transcode(
                         raw_path,
                         out,

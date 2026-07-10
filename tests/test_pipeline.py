@@ -387,6 +387,282 @@ async def test_pipeline_cleans_up_temp_dir_on_success(db_factory, tmp_path):
     assert not job_temp.exists()
 
 
+# ── per-title raw/transcode subdirectory isolation ─────────────────────────────
+# Regression coverage for the bug where every title in a multi-title rip shared
+# one raw_dir, and Ripper.rip() (which returns "the largest .mkv in output_dir")
+# could therefore return an earlier, larger title's file when ripping a later,
+# smaller title. The fix gives each title_id its own raw_dir/{title_id}/ (and
+# transcoded_dir/{title_id}/) subdirectory.
+
+
+@pytest.mark.asyncio
+async def test_pipeline_rips_titles_into_distinct_subdirectories(db_factory, tmp_path):
+    """Each title in a multi-title rip must be written to its own raw_dir/{title_id}/
+    subdirectory rather than a single shared directory."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    episodes = [
+        TitleInfo(0, "Episode 1", 2700, "t00.mkv", 4),
+        TitleInfo(1, "Episode 2", 2640, "t01.mkv", 4),
+        TitleInfo(2, "Episode 3", 2610, "t02.mkv", 4),
+    ]
+
+    rip_calls: list[tuple[int, Path]] = []
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        rip_calls.append((title_id, output_dir))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(f"raw-{title_id}".encode())
+        if on_progress:
+            await on_progress(100)
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(input_path.read_bytes())
+        if on_progress:
+            await on_progress(100)
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=episodes)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=MediaInfo(
+        title="Some Show", year=2010, disc_type=DiscType.TV_SHOW, tmdb_id=42
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "SOME_SHOW")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "SOME_SHOW")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+
+    raw_dir = config.settings.temp_path / str(job_id) / "raw"
+    output_dirs = [output_dir for _, output_dir in rip_calls]
+
+    # Each title got its own subdirectory, named after its title_id.
+    assert output_dirs == [raw_dir / "0", raw_dir / "1", raw_dir / "2"]
+    assert len(set(output_dirs)) == 3
+
+    season_dir = tmp_path / "library" / "TV Shows" / "Some Show (2010)" / "Season 01"
+    assert (season_dir / "Some Show - S01E01.mkv").read_bytes() == b"raw-0"
+    assert (season_dir / "Some Show - S01E02.mkv").read_bytes() == b"raw-1"
+    assert (season_dir / "Some Show - S01E03.mkv").read_bytes() == b"raw-2"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_title_attribution_survives_largest_file_selection(db_factory, tmp_path):
+    """Regression test for the specific bug: ripping a larger title A followed by a
+    smaller title B used to be able to return title A's file for title B, because
+    Ripper.rip() picks the largest .mkv file present in its output_dir. The fake rip
+    stub here mirrors that real selection logic (rather than just returning a
+    hardcoded path) so the per-title subdirectory fix is actually exercised — if
+    titles still shared one output_dir, ripping title B second would incorrectly
+    pick up title A's larger file."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    titles = [
+        TitleInfo(0, "Episode 1", 2700, "t00.mkv", 4),
+        TitleInfo(1, "Episode 2", 2640, "t01.mkv", 4),
+    ]
+    sizes = {0: 10_000, 1: 500}  # title 0 intentionally much larger than title 1
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(bytes([title_id + 1]) * sizes[title_id])
+        if on_progress:
+            await on_progress(100)
+        # Mirrors jacques.services.ripper.Ripper.rip(): return the largest .mkv
+        # file currently present in output_dir.
+        return max(output_dir.glob("*.mkv"), key=lambda p: p.stat().st_size)
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(input_path.read_bytes())
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=titles)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=MediaInfo(
+        title="Regression Show", year=2015, disc_type=DiscType.TV_SHOW, tmdb_id=7
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "REGRESSION_SHOW")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "REGRESSION_SHOW")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+
+    season_dir = tmp_path / "library" / "TV Shows" / "Regression Show (2015)" / "Season 01"
+    ep1 = season_dir / "Regression Show - S01E01.mkv"
+    ep2 = season_dir / "Regression Show - S01E02.mkv"
+
+    assert ep1.read_bytes() == bytes([1]) * 10_000
+    # Under the old shared-directory bug, this would incorrectly equal ep1's content.
+    assert ep2.read_bytes() == bytes([2]) * 500
+    assert ep1.read_bytes() != ep2.read_bytes()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_resumes_transcoding_from_per_title_raw_subdirs(db_factory, tmp_path):
+    """When resuming a rerun starting at TRANSCODING, raw files must be discovered
+    from raw_dir/{title_id}/*.mkv and processed in numeric title_id order — not
+    lexicographic order, where "10" would incorrectly sort before "2"."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    job_id = await _create_job(db_factory, "/dev/sr0", "RESUME_SHOW")
+    async with db_factory() as db:
+        job = await db.get(Job, job_id)
+        job.title = "Resume Show"
+        job.year = 2012
+        job.disc_type = DiscType.TV_SHOW
+        job.tmdb_id = 99
+        await db.commit()
+
+    job_temp = config.settings.temp_path / str(job_id)
+    raw_dir = job_temp / "raw"
+    (raw_dir / "2").mkdir(parents=True)
+    (raw_dir / "2" / "t02.mkv").write_bytes(b"raw-title-2")
+    (raw_dir / "10").mkdir(parents=True)
+    (raw_dir / "10" / "t10.mkv").write_bytes(b"raw-title-10")
+    (raw_dir / ".done").touch()
+
+    transcode_calls: list[Path] = []
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        transcode_calls.append(input_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(input_path.read_bytes())
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+    ):
+        await daemon._run_pipeline(
+            job_id, "/dev/sr0", "RESUME_SHOW", start_stage=JobStatus.TRANSCODING
+        )
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+
+    # Numeric sort: title_id 2 before title_id 10.
+    assert [p.parent.name for p in transcode_calls] == ["2", "10"]
+
+    season_dir = tmp_path / "library" / "TV Shows" / "Resume Show (2012)" / "Season 01"
+    assert (season_dir / "Resume Show - S01E01.mkv").read_bytes() == b"raw-title-2"
+    assert (season_dir / "Resume Show - S01E02.mkv").read_bytes() == b"raw-title-10"
+
+
+@pytest.mark.asyncio
+async def test_find_resumable_paths_raw_only_sorted_by_title_id(db_factory, tmp_path):
+    """_find_resumable_paths() must glob one level deeper (raw_dir/*/*.mkv) and sort
+    by numeric title_id, using the raw-only branch (no transcoded output present)."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    async with db_factory() as db:
+        prior_job = Job(drive_path="/dev/sr0", disc_label="RESUME_DISC", status=JobStatus.FAILED)
+        db.add(prior_job)
+        await db.commit()
+        await db.refresh(prior_job)
+        prior_job_id = prior_job.id
+
+    prior_temp = config.settings.temp_path / str(prior_job_id)
+    raw_dir = prior_temp / "raw"
+    (raw_dir / "5").mkdir(parents=True)
+    (raw_dir / "5" / "t05.mkv").write_bytes(b"raw-5")
+    (raw_dir / "20").mkdir(parents=True)
+    (raw_dir / "20" / "t20.mkv").write_bytes(b"raw-20")
+    (raw_dir / ".done").touch()
+
+    with patch("jacques.daemon.AsyncSessionLocal", db_factory):
+        raw_paths, transcoded_paths, found_prior_id = await daemon._find_resumable_paths(
+            "RESUME_DISC", exclude_job_id=prior_job_id + 1
+        )
+
+    assert found_prior_id == prior_job_id
+    assert transcoded_paths == []
+    assert [p.parent.name for p in raw_paths] == ["5", "20"]
+
+
+@pytest.mark.asyncio
+async def test_find_resumable_paths_transcoded_found_sorted_by_title_id(db_factory, tmp_path):
+    """When a prior job's transcoded output is present and complete,
+    _find_resumable_paths() must return both raw and transcoded paths from their
+    per-title subdirectories, sorted by numeric title_id."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    async with db_factory() as db:
+        prior_job = Job(drive_path="/dev/sr0", disc_label="RESUME_DISC_2", status=JobStatus.FAILED)
+        db.add(prior_job)
+        await db.commit()
+        await db.refresh(prior_job)
+        prior_job_id = prior_job.id
+
+    prior_temp = config.settings.temp_path / str(prior_job_id)
+
+    transcoded_dir = prior_temp / "transcoded"
+    (transcoded_dir / "3").mkdir(parents=True)
+    (transcoded_dir / "3" / "t03.mkv").write_bytes(b"transcoded-3")
+    (transcoded_dir / "11").mkdir(parents=True)
+    (transcoded_dir / "11" / "t11.mkv").write_bytes(b"transcoded-11")
+    (transcoded_dir / ".done").touch()
+
+    # No raw_dir/".done" marker here — the transcoded-found branch doesn't require
+    # one; raw is only kept around as a cleanup reference in that case.
+    raw_dir = prior_temp / "raw"
+    (raw_dir / "3").mkdir(parents=True)
+    (raw_dir / "3" / "t03.mkv").write_bytes(b"raw-3")
+    (raw_dir / "11").mkdir(parents=True)
+    (raw_dir / "11" / "t11.mkv").write_bytes(b"raw-11")
+
+    with patch("jacques.daemon.AsyncSessionLocal", db_factory):
+        raw_paths, transcoded_paths, found_prior_id = await daemon._find_resumable_paths(
+            "RESUME_DISC_2", exclude_job_id=prior_job_id + 1
+        )
+
+    assert found_prior_id == prior_job_id
+    assert [p.parent.name for p in transcoded_paths] == ["3", "11"]
+    assert [p.parent.name for p in raw_paths] == ["3", "11"]
+
+
 # ── select endpoint fixture ───────────────────────────────────────────────────
 
 

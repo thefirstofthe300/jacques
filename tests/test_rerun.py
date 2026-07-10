@@ -269,10 +269,11 @@ async def test_rerun_from_transcoding_uses_existing_raw_files(db_factory, tmp_pa
             tmdb_id=42,
         )
 
-    # Now set up the raw directory with a .done marker
+    # Now set up the raw directory with a .done marker. Raw files live in a
+    # per-title_id subdirectory (raw_dir/{title_id}/*.mkv).
     raw_dir = config.settings.temp_path / str(job_id) / "raw"
-    raw_dir.mkdir(parents=True)
-    raw_file = raw_dir / "title_t00.mkv"
+    (raw_dir / "0").mkdir(parents=True)
+    raw_file = raw_dir / "0" / "title_t00.mkv"
     raw_file.write_bytes(b"raw ripped content")
     (raw_dir / ".done").touch()
 
@@ -347,8 +348,8 @@ async def test_rerun_from_transcoding_no_raw_done_marker_skips_transcode(db_fact
 
         # raw dir exists but NO .done marker
         raw_dir = config.settings.temp_path / str(job_id) / "raw"
-        raw_dir.mkdir(parents=True)
-        (raw_dir / "title_t00.mkv").write_bytes(b"partial rip")
+        (raw_dir / "0").mkdir(parents=True)
+        (raw_dir / "0" / "title_t00.mkv").write_bytes(b"partial rip")
 
         await daemon._run_pipeline(
             job_id, "/dev/sr0", "MISSING_RAW", start_stage=JobStatus.TRANSCODING
@@ -407,10 +408,11 @@ async def test_rerun_from_organizing_uses_existing_transcoded_files(db_factory, 
             tmdb_id=438631,
         )
 
-    # Set up the transcoded directory
+    # Set up the transcoded directory. Transcoded files live in a per-title_id
+    # subdirectory (transcoded_dir/{title_id}/*.mkv).
     transcoded_dir = config.settings.temp_path / str(job_id) / "transcoded"
-    transcoded_dir.mkdir(parents=True)
-    transcoded_file = transcoded_dir / "dune.mkv"
+    (transcoded_dir / "0").mkdir(parents=True)
+    transcoded_file = transcoded_dir / "0" / "dune.mkv"
     transcoded_file.write_bytes(b"h265 transcoded dune")
     (transcoded_dir / ".done").touch()
 
@@ -465,8 +467,8 @@ async def test_rerun_from_organizing_no_transcoded_done_marker_completes_empty(d
 
         # transcoded dir exists but NO .done marker
         transcoded_dir = config.settings.temp_path / str(job_id) / "transcoded"
-        transcoded_dir.mkdir(parents=True)
-        (transcoded_dir / "film.mkv").write_bytes(b"incomplete transcode")
+        (transcoded_dir / "0").mkdir(parents=True)
+        (transcoded_dir / "0" / "film.mkv").write_bytes(b"incomplete transcode")
 
         await daemon._run_pipeline(
             job_id, "/dev/sr0", "MISSING_TRANSCODED", start_stage=JobStatus.ORGANIZING
@@ -508,8 +510,8 @@ async def test_rerun_from_fetching_metadata_with_raw_files_does_not_transcode(db
             db_factory, "/dev/sr0", "RAW_EXISTS", disc_type=DiscType.MOVIE
         )
         raw_dir = config.settings.temp_path / str(job_id) / "raw"
-        raw_dir.mkdir(parents=True)
-        (raw_dir / "title_t00.mkv").write_bytes(b"raw content")
+        (raw_dir / "0").mkdir(parents=True)
+        (raw_dir / "0" / "title_t00.mkv").write_bytes(b"raw content")
         (raw_dir / ".done").touch()
 
         await daemon._run_pipeline(
