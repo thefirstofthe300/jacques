@@ -97,6 +97,20 @@ def _should_run(stage: JobStatus, start_stage: JobStatus) -> bool:
         return True
 
 
+def _titles_to_rip(ripper: Ripper, disc_type_hint: DiscType, titles: list[TitleInfo]) -> list[TitleInfo]:
+    """Decide which titles to rip given the disc type hint.
+
+    TV shows rip every title. Movies rip only the main feature — unless multiple
+    titles are plausible candidates and none is flagged as the main feature, in
+    which case ripping all of them (rather than guessing) lets the user pick later.
+    """
+    if disc_type_hint == DiscType.TV_SHOW:
+        return titles
+    if len(titles) == 1 or not ripper.has_ambiguous_main_feature(titles):
+        return [ripper.select_main_title(titles)]
+    return titles
+
+
 async def _run_pipeline(
     job_id: int,
     drive_path: str,
@@ -130,11 +144,7 @@ async def _run_pipeline(
                 disc_type_hint = job.disc_type
                 if job.titles_json:
                     all_titles = [TitleInfo(**t) for t in json.loads(job.titles_json)]
-                    titles_to_rip = (
-                        all_titles
-                        if disc_type_hint == DiscType.TV_SHOW
-                        else [ripper.select_main_title(all_titles)]
-                    )
+                    titles_to_rip = _titles_to_rip(ripper, disc_type_hint, all_titles)
                 if not _should_run(JobStatus.FETCHING_METADATA, start_stage) and job.title:
                     media_info = MediaInfo(
                         title=job.title,
@@ -168,7 +178,7 @@ async def _run_pipeline(
                 titles_json=json.dumps([dataclasses.asdict(t) for t in titles]),
             )
 
-            titles_to_rip = titles if disc_type_hint == DiscType.TV_SHOW else [ripper.select_main_title(titles)]
+            titles_to_rip = _titles_to_rip(ripper, disc_type_hint, titles)
 
         # ── FETCHING METADATA ──────────────────────────────────────────────────
         if _should_run(JobStatus.FETCHING_METADATA, start_stage):

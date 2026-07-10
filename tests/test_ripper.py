@@ -76,6 +76,31 @@ def test_is_tv_show_hint_dissimilar_durations():
     assert not Ripper("/dev/sr0").is_tv_show_hint(titles)
 
 
+def test_has_ambiguous_main_feature_single_title():
+    titles = [TitleInfo(0, "Movie", 7200, "t00.mkv")]
+    assert not Ripper("/dev/sr0").has_ambiguous_main_feature(titles)
+
+
+def test_has_ambiguous_main_feature_one_flagged():
+    titles = [
+        TitleInfo(0, "Title (FPL_MainFeature)", 7200, "t00.mkv"),
+        TitleInfo(1, "Other Title", 6900, "t01.mkv"),
+    ]
+    assert not Ripper("/dev/sr0").has_ambiguous_main_feature(titles)
+
+
+def test_has_ambiguous_main_feature_none_flagged():
+    titles = [
+        TitleInfo(0, "Title A", 7200, "t00.mkv"),
+        TitleInfo(1, "Title B", 6900, "t01.mkv"),
+    ]
+    assert Ripper("/dev/sr0").has_ambiguous_main_feature(titles)
+
+
+def test_has_ambiguous_main_feature_empty_list():
+    assert not Ripper("/dev/sr0").has_ambiguous_main_feature([])
+
+
 # ── async helpers ─────────────────────────────────────────────────────────────
 
 

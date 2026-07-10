@@ -14,12 +14,12 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 from jacques.api.app import app
-from jacques.daemon import _reset_interrupted_jobs
+from jacques.daemon import _reset_interrupted_jobs, _titles_to_rip
 from jacques.database import get_db
 from jacques.models.job import DiscType, Job, JobStatus
 from jacques.models.ripped_disc import RippedDisc
 from jacques.services.metadata import MediaInfo
-from jacques.services.ripper import TitleInfo
+from jacques.services.ripper import Ripper, TitleInfo
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -45,6 +45,40 @@ async def _create_job(db_factory, drive_path: str, disc_label: str | None) -> in
 async def _get_job(db_factory, job_id: int) -> Job:
     async with db_factory() as db:
         return await db.get(Job, job_id)
+
+
+# ── _titles_to_rip unit tests ─────────────────────────────────────────────────
+
+
+def test_titles_to_rip_tv_show_returns_all_titles():
+    ripper = Ripper("/dev/sr0")
+    titles = [
+        TitleInfo(0, "Episode 1", 2700, "t00.mkv"),
+        TitleInfo(1, "Episode 2", 2640, "t01.mkv"),
+    ]
+    assert _titles_to_rip(ripper, DiscType.TV_SHOW, titles) == titles
+
+
+def test_titles_to_rip_movie_single_title():
+    ripper = Ripper("/dev/sr0")
+    titles = [TitleInfo(0, "Feature", 7200, "t00.mkv")]
+    assert _titles_to_rip(ripper, DiscType.MOVIE, titles) == [titles[0]]
+
+
+def test_titles_to_rip_movie_multiple_with_flagged_main_feature():
+    ripper = Ripper("/dev/sr0")
+    main = TitleInfo(0, "Title (FPL_MainFeature)", 7200, "t00.mkv")
+    other = TitleInfo(1, "Other Title", 6900, "t01.mkv")
+    assert _titles_to_rip(ripper, DiscType.MOVIE, [main, other]) == [main]
+
+
+def test_titles_to_rip_movie_multiple_ambiguous_returns_all():
+    ripper = Ripper("/dev/sr0")
+    titles = [
+        TitleInfo(0, "Title A", 7200, "t00.mkv"),
+        TitleInfo(1, "Title B", 6900, "t01.mkv"),
+    ]
+    assert _titles_to_rip(ripper, DiscType.MOVIE, titles) == titles
 
 
 # ── tests ─────────────────────────────────────────────────────────────────────
@@ -108,6 +142,68 @@ async def test_pipeline_movie_reaches_complete(db_factory, tmp_path):
     )
     assert expected.exists()
     assert expected.read_bytes() == b"fake h265 mkv"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_ambiguous_movie_rips_all_candidates(db_factory, tmp_path):
+    """When a disc looks like a movie (not a TV-show hint) but has multiple titles
+    with none flagged as FPL_MainFeature, the pipeline should rip every candidate
+    rather than guessing via select_main_title."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    candidates = [
+        TitleInfo(0, "Title A", 7200, "t00.mkv", 1),
+        TitleInfo(1, "Title B", 6900, "t01.mkv", 1),
+    ]
+
+    rip_calls: list[int] = []
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        rip_calls.append(title_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(f"raw-{title_id}".encode())
+        if on_progress:
+            await on_progress(100)
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(input_path.read_bytes())
+        if on_progress:
+            await on_progress(100)
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=candidates)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.has_ambiguous_main_feature = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=MediaInfo(
+        title="Ambiguous Movie", year=2020, disc_type=DiscType.MOVIE, tmdb_id=1
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "AMBIGUOUS_MOVIE")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "AMBIGUOUS_MOVIE")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    assert job.disc_type == DiscType.MOVIE
+
+    # Both candidates were ripped — no single-title guess was made.
+    assert rip_calls == [0, 1]
 
 
 @pytest.mark.asyncio

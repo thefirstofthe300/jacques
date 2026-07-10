@@ -122,6 +122,14 @@ class Ripper:
         # All titles within 30% of each other → likely episodes
         return durations[0] / durations[-1] > 0.7
 
+    def has_ambiguous_main_feature(self, titles: list[TitleInfo]) -> bool:
+        """True when there are multiple titles and none is flagged as the main feature.
+
+        In this situation `select_main_title` would silently fall back to guessing
+        "longest duration" — callers should treat this as ambiguous instead of guessing.
+        """
+        return len(titles) > 1 and not any(t.is_main_feature_hint for t in titles)
+
     async def rip(
         self,
         title_id: int,
