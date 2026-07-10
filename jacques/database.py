@@ -1,4 +1,4 @@
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -22,6 +22,10 @@ AsyncSessionLocal: sessionmaker = sessionmaker(
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Migrate existing databases: add disc_uuid to jobs if not present.
+        result = await conn.execute(text("PRAGMA table_info(jobs)"))
+        if "disc_uuid" not in {row[1] for row in result}:
+            await conn.execute(text("ALTER TABLE jobs ADD COLUMN disc_uuid TEXT"))
 
     # One-time backfill: seed ripped_discs from existing COMPLETE jobs.
     # Safe to run on every startup — skips any disc_label that already has a row.
