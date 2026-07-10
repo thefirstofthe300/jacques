@@ -11,7 +11,7 @@ class Settings(BaseSettings):
 
     makemkvcon_path: str = "makemkvcon"
     handbrake_path: str = "HandBrakeCLI"
-    handbrake_quality: int = 20
+    handbrake_quality: int = 18
     handbrake_preset: str = "medium"
 
     tmdb_api_key: str = ""
