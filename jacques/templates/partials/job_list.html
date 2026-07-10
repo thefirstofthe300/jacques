@@ -152,6 +152,81 @@
       </div>
       {% endif %}
 
+      {% if job.status.value == "awaiting_title_selection" %}
+      <div class="mt-3">
+        <div class="small text-warning mb-2">
+          <i class="bi bi-question-circle-fill me-1"></i>Multiple candidate titles were ripped — pick which one to keep:
+        </div>
+        <div class="d-flex flex-column gap-2">
+          {% for t in job.parsed_titles %}
+          <div class="d-flex justify-content-between align-items-center border border-secondary rounded p-2">
+            <div class="flex-grow-1 me-2">
+              <div class="fw-semibold small">
+                {{ t.name or "Title " ~ t.id }}
+              </div>
+              <div class="text-muted" style="font-size:0.75rem">
+                <i class="bi bi-clock-history me-1"></i>{{ (t.duration_seconds // 3600) }}:{{ '%02d'|format((t.duration_seconds % 3600) // 60) }}:{{ '%02d'|format(t.duration_seconds % 60) }}
+              </div>
+            </div>
+            <button class="btn btn-sm btn-outline-primary flex-shrink-0"
+                    hx-post="/api/jobs/{{ job.id }}/keep-title/{{ t.id }}"
+                    hx-swap="none"
+                    hx-confirm="Keep this title? The other candidate rips will be discarded.">
+              Keep this one
+            </button>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+
+      {% if job.status.value == "awaiting_episode_assignment" %}
+      <div class="mt-3">
+        <div class="small text-warning mb-2">
+          <i class="bi bi-question-circle-fill me-1"></i>Assign season/episode/name to each ripped title:
+        </div>
+        <div class="d-flex flex-column gap-2">
+          {% for t in job.parsed_titles %}
+          <div class="border border-secondary rounded p-2">
+            <div class="fw-semibold small mb-1">
+              {{ t.name or "Title " ~ t.id }}
+            </div>
+            <div class="text-muted mb-2" style="font-size:0.75rem">
+              <i class="bi bi-clock-history me-1"></i>{{ (t.duration_seconds // 3600) }}:{{ '%02d'|format((t.duration_seconds % 3600) // 60) }}:{{ '%02d'|format(t.duration_seconds % 60) }}
+            </div>
+            <div class="d-flex gap-2 flex-wrap align-items-center">
+              <input type="number"
+                     id="ep-season-{{ job.id }}-{{ t.id }}"
+                     class="form-control form-control-sm bg-dark text-light border-secondary"
+                     style="max-width: 90px"
+                     placeholder="Season"
+                     min="1"
+                     value="1">
+              <input type="number"
+                     id="ep-episode-{{ job.id }}-{{ t.id }}"
+                     class="form-control form-control-sm bg-dark text-light border-secondary"
+                     style="max-width: 90px"
+                     placeholder="Episode"
+                     min="1"
+                     value="{{ loop.index }}">
+              <input type="text"
+                     id="ep-name-{{ job.id }}-{{ t.id }}"
+                     class="form-control form-control-sm bg-dark text-light border-secondary"
+                     style="max-width: 220px"
+                     placeholder="Episode name">
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+        <div class="mt-2">
+          <button class="btn btn-sm btn-outline-primary"
+                  onclick="submitEpisodeAssignments({{ job.id }}, [{{ job.parsed_titles | map(attribute='id') | join(', ') }}])">
+            Save &amp; Continue
+          </button>
+        </div>
+      </div>
+      {% endif %}
+
       <div class="mt-2 small text-muted">
         <i class="bi bi-clock me-1"></i>{{ job.created_at.strftime("%Y-%m-%d %H:%M") }}
       </div>

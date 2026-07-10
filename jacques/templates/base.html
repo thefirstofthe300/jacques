@@ -74,6 +74,24 @@
     htmx.ajax('POST', '/api/jobs/' + jobId + '/select/' + tmdbId + discType, {swap: 'none'});
   }
 
+  function submitEpisodeAssignments(jobId, titleIds) {
+    var assignments = titleIds.map(function (titleId) {
+      var season = parseInt(document.getElementById('ep-season-' + jobId + '-' + titleId).value, 10);
+      var episode = parseInt(document.getElementById('ep-episode-' + jobId + '-' + titleId).value, 10);
+      var name = document.getElementById('ep-name-' + jobId + '-' + titleId).value;
+      return {title_id: titleId, season: season, episode: episode, name: name};
+    });
+    if (assignments.some(function (a) { return !a.season || !a.episode; })) {
+      alert('Please enter a valid season and episode number for every title');
+      return;
+    }
+    fetch('/api/jobs/' + jobId + '/assign-episodes', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(assignments),
+    });
+  }
+
   // Preserve input values and dynamically-loaded candidate lists across
   // job-list innerHTML swaps. HTMX fires beforeSwap and afterSwap synchronously
   // in the same JS task, so the browser never renders the intermediate state.

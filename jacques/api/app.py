@@ -24,6 +24,8 @@ _STATUS_CLASSES: dict[str, str] = {
     "fetching_metadata": "bg-warning text-dark",
     "organizing": "bg-warning text-dark",
     "awaiting_selection": "bg-warning text-dark",
+    "awaiting_episode_assignment": "bg-warning text-dark",
+    "awaiting_title_selection": "bg-warning text-dark",
     "complete": "bg-success",
     "failed": "bg-danger",
 }
