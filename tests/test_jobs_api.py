@@ -588,6 +588,19 @@ async def test_delete_204_duplicate_detected_job(api_client, db_factory):
 
 
 @pytest.mark.asyncio
+async def test_delete_204_awaiting_selection_job(api_client, db_factory):
+    """DELETE on an AWAITING_SELECTION job returns 204 and removes the row from the DB."""
+    job_id = await _create_job(
+        db_factory, status=JobStatus.AWAITING_SELECTION, error_message=None
+    )
+
+    response = await api_client.delete(f"/api/jobs/{job_id}")
+
+    assert response.status_code == 204
+    assert await _get_job(db_factory, job_id) is None
+
+
+@pytest.mark.asyncio
 async def test_delete_409_active_job(api_client, db_factory):
     """DELETE on a RIPPING (active) job returns 409."""
     job_id = await _create_job(db_factory, status=JobStatus.RIPPING, error_message=None)

@@ -638,7 +638,7 @@ async def test_pipeline_inserts_ripped_disc_on_complete(db_factory, tmp_path):
             await db.refresh(job)
             job_id = job.id
 
-        await daemon._run_pipeline(job_id, "/dev/sr0", "THE_MATRIX")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "THE_MATRIX", "abc-123")
 
     async with db_factory() as db:
         row = await db.scalar(

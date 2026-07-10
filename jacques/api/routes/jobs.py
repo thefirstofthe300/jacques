@@ -217,14 +217,15 @@ async def rerip_job(
     if job.status != JobStatus.DUPLICATE_DETECTED:
         raise HTTPException(status_code=409, detail="Job is not a duplicate")
 
+    queue = getattr(request.app.state, "rerun_queue", None)
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
     job.status = JobStatus.IDENTIFYING
     job.progress = 0
     job.error_message = None
     await db.commit()
 
-    queue = getattr(request.app.state, "rerun_queue", None)
-    if queue is None:
-        raise HTTPException(status_code=503, detail="Service not ready")
     await queue.put((job_id, JobStatus.IDENTIFYING))
 
     return JSONResponse(status_code=202, content={"job_id": job_id})

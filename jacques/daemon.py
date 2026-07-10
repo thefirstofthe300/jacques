@@ -101,6 +101,7 @@ async def _run_pipeline(
     job_id: int,
     drive_path: str,
     disc_label: str | None,
+    disc_uuid: str | None = None,
     start_stage: JobStatus = JobStatus.IDENTIFYING,
 ) -> None:
     job_temp = settings.temp_path / str(job_id)
@@ -272,22 +273,19 @@ async def _run_pipeline(
         # detected as duplicates.  Only insert when at least one identifier is
         # present (the check constraint requires it).  Skip silently if a row
         # for this job already exists (idempotent re-runs).
-        async with AsyncSessionLocal() as db:
-            job = await db.get(Job, job_id)
-            job_disc_label = job.disc_label if job is not None else disc_label
-            job_disc_uuid = job.disc_uuid if job is not None else None
-            if job_disc_label is not None or job_disc_uuid is not None:
+        if disc_label is not None or disc_uuid is not None:
+            async with AsyncSessionLocal() as db:
                 existing = await db.scalar(
                     select(RippedDisc).where(RippedDisc.job_id == job_id).limit(1)
                 )
                 if existing is None:
                     db.add(RippedDisc(
-                        disc_label=job_disc_label,
-                        disc_uuid=job_disc_uuid,
+                        disc_label=disc_label,
+                        disc_uuid=disc_uuid,
                         job_id=job_id,
                     ))
                     await db.commit()
-                    log.info("Job %d: recorded in ripped_discs (label=%r, uuid=%r)", job_id, job_disc_label, job_disc_uuid)
+                    log.info("Job %d: recorded in ripped_discs (label=%r, uuid=%r)", job_id, disc_label, disc_uuid)
 
         log.info("Job %d complete", job_id)
 
@@ -312,7 +310,7 @@ async def _process_reruns(queue: asyncio.Queue[tuple[int, JobStatus]]) -> None:
                 continue
 
             asyncio.create_task(
-                _run_pipeline(job_id, job.drive_path, job.disc_label, start_stage),
+                _run_pipeline(job_id, job.drive_path, job.disc_label, job.disc_uuid, start_stage),
                 name=f"rerun-{job_id}",
             )
         except Exception:
@@ -371,7 +369,7 @@ async def _process_jobs(queue: asyncio.Queue[tuple[str, str | None, str | None]]
 
             # Each disc runs its pipeline independently so multiple drives work concurrently.
             asyncio.create_task(
-                _run_pipeline(job_id, drive_path, disc_label),
+                _run_pipeline(job_id, drive_path, disc_label, disc_uuid),
                 name=f"pipeline-{job_id}",
             )
         except Exception:
@@ -383,7 +381,7 @@ async def _process_jobs(queue: asyncio.Queue[tuple[str, str | None, str | None]]
 async def _reset_interrupted_jobs() -> int:
     """Mark in-progress jobs failed on startup. AWAITING_SELECTION is preserved."""
     # AWAITING_SELECTION is a deliberate user-action pause — it survives daemon restarts.
-    preserved = {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.AWAITING_SELECTION}
+    preserved = {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.AWAITING_SELECTION, JobStatus.DUPLICATE_DETECTED}
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(Job).where(Job.status.not_in(preserved)))
         interrupted = result.scalars().all()

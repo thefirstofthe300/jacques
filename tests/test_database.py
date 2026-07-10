@@ -62,6 +62,13 @@ async def _get_ripped_disc(factory, disc_label: str) -> RippedDisc | None:
         )
 
 
+async def _get_ripped_disc_by_uuid(factory, disc_uuid: str) -> RippedDisc | None:
+    async with factory() as session:
+        return await session.scalar(
+            select(RippedDisc).where(RippedDisc.disc_uuid == disc_uuid)
+        )
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 _UPDATED_AT = datetime(2024, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -107,10 +114,11 @@ async def test_complete_job_with_label_creates_ripped_disc(backfill_db):
     assert disc.ripped_at.replace(tzinfo=None) == _UPDATED_AT.replace(tzinfo=None)
 
 
-async def test_complete_job_with_null_disc_label_is_skipped(backfill_db):
-    """A COMPLETE job with disc_label=None must not produce a ripped_discs row."""
+async def test_complete_job_with_null_disc_label_and_null_uuid_is_skipped(backfill_db):
+    """A COMPLETE job with both disc_label=None and disc_uuid=None must not produce a
+    ripped_discs row — there is nothing to key the deduplication on."""
     engine, factory = backfill_db
-    await _seed_job(factory, disc_label=None, disc_uuid="uuid-no-label")
+    await _seed_job(factory, disc_label=None, disc_uuid=None)
 
     await _run_init_db(engine, factory)
 
@@ -208,3 +216,18 @@ async def test_disc_uuid_may_be_none_on_backfilled_row(backfill_db):
     disc = await _get_ripped_disc(factory, "NO_UUID_DISC")
     assert disc is not None
     assert disc.disc_uuid is None
+
+
+async def test_complete_job_with_uuid_only_creates_ripped_disc(backfill_db):
+    """A COMPLETE job with disc_uuid set but disc_label=None creates a RippedDisc row
+    keyed by disc_uuid, with disc_label remaining None."""
+    engine, factory = backfill_db
+    job = await _seed_job(factory, disc_label=None, disc_uuid="some-uuid-123")
+
+    await _run_init_db(engine, factory)
+
+    disc = await _get_ripped_disc_by_uuid(factory, "some-uuid-123")
+    assert disc is not None
+    assert disc.disc_uuid == "some-uuid-123"
+    assert disc.disc_label is None
+    assert disc.job_id == job.id

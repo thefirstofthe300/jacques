@@ -1,4 +1,4 @@
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
@@ -32,16 +32,23 @@ async def init_db() -> None:
         result = await session.execute(
             select(Job).where(
                 Job.status == JobStatus.COMPLETE,
-                Job.disc_label.is_not(None),
+                or_(Job.disc_label.is_not(None), Job.disc_uuid.is_not(None)),
             )
         )
         jobs = result.scalars().all()
         for job in jobs:
-            existing = await session.scalar(
-                select(RippedDisc)
-                .where(RippedDisc.disc_label == job.disc_label)
-                .limit(1)
-            )
+            if job.disc_uuid is not None:
+                existing = await session.scalar(
+                    select(RippedDisc)
+                    .where(RippedDisc.disc_uuid == job.disc_uuid)
+                    .limit(1)
+                )
+            else:
+                existing = await session.scalar(
+                    select(RippedDisc)
+                    .where(RippedDisc.disc_label == job.disc_label)
+                    .limit(1)
+                )
             if existing is None:
                 session.add(
                     RippedDisc(
