@@ -27,12 +27,15 @@ class Organizer:
         media_info: MediaInfo | None,
         disc_label: str | None,
         episode_num: int = 1,
+        season_num: int = 1,
+        episode_title: str | None = None,
     ) -> Path:
         """Return the canonical destination path for a single output file.
 
         Follows Plex/Jellyfin naming conventions:
           Movies/Title (YYYY)/Title (YYYY).mkv
           TV Shows/Title (YYYY)/Season 01/Title - S01E01.mkv
+          TV Shows/Title (YYYY)/Season 01/Title - S01E01 - Episode Title.mkv
           Unknown/<disc_label>.mkv
         """
         if media_info is None:
@@ -50,9 +53,12 @@ class Organizer:
             self._output_path
             / "TV Shows"
             / f"{title}{year_suffix}"
-            / "Season 01"
+            / f"Season {season_num:02d}"
         )
-        return folder / f"{title} - S01E{episode_num:02d}.mkv"
+        episode_code = f"{title} - S{season_num:02d}E{episode_num:02d}"
+        if episode_title:
+            episode_code = f"{episode_code} - {_safe_name(episode_title)}"
+        return folder / f"{episode_code}.mkv"
 
     async def move(self, source: Path, destination: Path) -> None:
         """Move source to destination, creating parent directories as needed.

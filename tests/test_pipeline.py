@@ -272,7 +272,7 @@ async def test_pipeline_tv_rips_multiple_titles(db_factory, tmp_path):
                 drive_path="/dev/sr0",
                 disc_label="BREAKING_BAD_S1",
                 status=JobStatus.DETECTED,
-                episode_assignments=json.dumps({"0": 1, "1": 2}),
+                episode_assignments=json.dumps({"0": {"episode": 1}, "1": {"episode": 2}}),
             )
             db.add(job)
             await db.commit()
@@ -288,6 +288,227 @@ async def test_pipeline_tv_rips_multiple_titles(db_factory, tmp_path):
     season_dir = tmp_path / "library" / "TV Shows" / "Breaking Bad (2008)" / "Season 01"
     assert (season_dir / "Breaking Bad - S01E01.mkv").exists()
     assert (season_dir / "Breaking Bad - S01E02.mkv").exists()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_tv_organizes_using_per_title_episode_assignments(db_factory, tmp_path):
+    """Each title's destination must reflect the season/episode/name recorded
+    against ITS OWN title_id in episode_assignments — not its position in the
+    rip order, and not sequential 1,2,3 numbering. The disc titles are ripped
+    in the order [9, 5] but the JSON assignment keys are written [5, 9] (i.e.
+    not in ripping order), to prove the lookup is genuinely keyed by
+    path.parent.name (the title_id) rather than by list index."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    episodes = [
+        TitleInfo(9, "Homecoming Reel", 2700, "t09.mkv", 4),
+        TitleInfo(5, "Bottle Reel", 2640, "t05.mkv", 4),
+    ]
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(b"raw episode")
+        if on_progress:
+            await on_progress(100)
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"h265 episode")
+        if on_progress:
+            await on_progress(100)
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=episodes)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=MediaInfo(
+        title="Fringe", year=2011, disc_type=DiscType.TV_SHOW, tmdb_id=88
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="FRINGE_S2",
+                status=JobStatus.DETECTED,
+                episode_assignments=json.dumps({
+                    "5": {"season": 2, "episode": 10, "name": "The Bottle"},
+                    "9": {"season": 2, "episode": 3, "name": "Homecoming"},
+                }),
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
+        await daemon._run_pipeline(job_id, "/dev/sr0", "FRINGE_S2")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+
+    season_dir = tmp_path / "library" / "TV Shows" / "Fringe (2011)" / "Season 02"
+    # title_id 9 was ripped first (i=0) but must land on E03/Homecoming per its
+    # own assignment, not E01 (i+1 default) or E10 (title_id 5's assignment).
+    assert (season_dir / "Fringe - S02E03 - Homecoming.mkv").exists()
+    # title_id 5 was ripped second (i=1) but must land on E10/The Bottle.
+    assert (season_dir / "Fringe - S02E10 - The Bottle.mkv").exists()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_tv_missing_assignment_falls_back_to_default(db_factory, tmp_path):
+    """A title_id with no entry in episode_assignments must fall back to
+    episode_num=i+1, season_num=1, episode_title=None rather than crashing."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    episodes = [
+        TitleInfo(7, "Assigned Reel", 2700, "t07.mkv", 4),
+        TitleInfo(12, "Unassigned Reel", 2640, "t12.mkv", 4),
+    ]
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(b"raw episode")
+        if on_progress:
+            await on_progress(100)
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"h265 episode")
+        if on_progress:
+            await on_progress(100)
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=episodes)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=MediaInfo(
+        title="Partial Assignments Show", year=2013, disc_type=DiscType.TV_SHOW, tmdb_id=99
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="PARTIAL_SHOW",
+                status=JobStatus.DETECTED,
+                # Only title_id "7" has an assignment; "12" is absent entirely.
+                episode_assignments=json.dumps({
+                    "7": {"season": 3, "episode": 5, "name": "Assigned Episode"},
+                }),
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
+        await daemon._run_pipeline(job_id, "/dev/sr0", "PARTIAL_SHOW")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+
+    show_dir = tmp_path / "library" / "TV Shows" / "Partial Assignments Show (2013)"
+    # title_id 7 (ripped first, i=0) uses its explicit assignment.
+    assert (show_dir / "Season 03" / "Partial Assignments Show - S03E05 - Assigned Episode.mkv").exists()
+    # title_id 12 (ripped second, i=1) has no assignment entry — falls back to
+    # episode_num=i+1=2, season_num=1, no episode title.
+    assert (show_dir / "Season 01" / "Partial Assignments Show - S01E02.mkv").exists()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_tv_empty_assignments_dict_falls_back_to_default_for_all(db_factory, tmp_path):
+    """An entirely empty (but present, so the AWAITING_EPISODE_ASSIGNMENT pause
+    is not triggered) episode_assignments dict must fall back to i+1/Season 01
+    defaults for every title without crashing."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    episodes = [
+        TitleInfo(0, "Reel A", 2700, "t00.mkv", 4),
+        TitleInfo(1, "Reel B", 2640, "t01.mkv", 4),
+    ]
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(b"raw episode")
+        if on_progress:
+            await on_progress(100)
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"h265 episode")
+        if on_progress:
+            await on_progress(100)
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=episodes)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=MediaInfo(
+        title="No Assignments Show", year=2014, disc_type=DiscType.TV_SHOW, tmdb_id=100
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="NO_ASSIGNMENTS_SHOW",
+                status=JobStatus.DETECTED,
+                episode_assignments=json.dumps({}),
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
+        await daemon._run_pipeline(job_id, "/dev/sr0", "NO_ASSIGNMENTS_SHOW")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+
+    season_dir = tmp_path / "library" / "TV Shows" / "No Assignments Show (2014)" / "Season 01"
+    assert (season_dir / "No Assignments Show - S01E01.mkv").exists()
+    assert (season_dir / "No Assignments Show - S01E02.mkv").exists()
 
 
 @pytest.mark.asyncio
@@ -568,7 +789,7 @@ async def test_pipeline_skips_episode_assignment_pause_when_already_assigned(db_
                 drive_path="/dev/sr0",
                 disc_label="BREAKING_BAD_S1",
                 status=JobStatus.DETECTED,
-                episode_assignments=json.dumps({"0": 1, "1": 2}),
+                episode_assignments=json.dumps({"0": {"episode": 1}, "1": {"episode": 2}}),
             )
             db.add(job)
             await db.commit()
@@ -940,7 +1161,9 @@ async def test_pipeline_rips_titles_into_distinct_subdirectories(db_factory, tmp
                 drive_path="/dev/sr0",
                 disc_label="SOME_SHOW",
                 status=JobStatus.DETECTED,
-                episode_assignments=json.dumps({"0": 1, "1": 2, "2": 3}),
+                episode_assignments=json.dumps(
+                    {"0": {"episode": 1}, "1": {"episode": 2}, "2": {"episode": 3}}
+                ),
             )
             db.add(job)
             await db.commit()
@@ -1025,7 +1248,7 @@ async def test_pipeline_title_attribution_survives_largest_file_selection(db_fac
                 drive_path="/dev/sr0",
                 disc_label="REGRESSION_SHOW",
                 status=JobStatus.DETECTED,
-                episode_assignments=json.dumps({"0": 1, "1": 2}),
+                episode_assignments=json.dumps({"0": {"episode": 1}, "1": {"episode": 2}}),
             )
             db.add(job)
             await db.commit()

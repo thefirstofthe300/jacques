@@ -64,6 +64,89 @@ def test_build_destination_tv_default_episode_num(tmp_path):
     assert "S01E01" in dest.name
 
 
+def test_build_destination_tv_default_season_and_no_title_matches_old_naming(tmp_path):
+    """Regression: omitting season_num/episode_title must produce the exact same
+    path as before those params existed — no "Season 01" surprises, no trailing
+    " - Episode Title" suffix."""
+    org = Organizer(tmp_path)
+    info = MediaInfo("Breaking Bad", 2008, DiscType.TV_SHOW, 456)
+    dest = org.build_destination(info, "BREAKING_BAD", episode_num=3)
+    expected = (
+        tmp_path / "TV Shows" / "Breaking Bad (2008)" / "Season 01" / "Breaking Bad - S01E03.mkv"
+    )
+    assert dest == expected
+
+
+def test_build_destination_tv_custom_season_num(tmp_path):
+    org = Organizer(tmp_path)
+    info = MediaInfo("Breaking Bad", 2008, DiscType.TV_SHOW, 456)
+    dest = org.build_destination(info, "BREAKING_BAD", episode_num=10, season_num=2)
+    expected = (
+        tmp_path
+        / "TV Shows"
+        / "Breaking Bad (2008)"
+        / "Season 02"
+        / "Breaking Bad - S02E10.mkv"
+    )
+    assert dest == expected
+
+
+def test_build_destination_tv_episode_title_appended(tmp_path):
+    org = Organizer(tmp_path)
+    info = MediaInfo("Breaking Bad", 2008, DiscType.TV_SHOW, 456)
+    dest = org.build_destination(
+        info, "BREAKING_BAD", episode_num=1, season_num=1, episode_title="Pilot"
+    )
+    expected = (
+        tmp_path
+        / "TV Shows"
+        / "Breaking Bad (2008)"
+        / "Season 01"
+        / "Breaking Bad - S01E01 - Pilot.mkv"
+    )
+    assert dest == expected
+
+
+def test_build_destination_tv_episode_title_sanitized(tmp_path):
+    org = Organizer(tmp_path)
+    info = MediaInfo("Breaking Bad", 2008, DiscType.TV_SHOW, 456)
+    dest = org.build_destination(
+        info,
+        "BREAKING_BAD",
+        episode_num=1,
+        season_num=1,
+        episode_title="Ozymandias: A/B Sides",
+    )
+    assert dest.name == "Breaking Bad - S01E01 - Ozymandias_ A_B Sides.mkv"
+    assert ":" not in dest.name
+    assert "/" not in dest.name
+
+
+def test_build_destination_movie_unaffected_by_season_and_episode_title(tmp_path):
+    """Movie destinations must ignore season_num/episode_title entirely, even
+    when non-default values are passed."""
+    org = Organizer(tmp_path)
+    info = MediaInfo("Inception", 2010, DiscType.MOVIE, 123)
+    dest = org.build_destination(
+        info, "INCEPTION", episode_num=5, season_num=3, episode_title="Should Not Appear"
+    )
+    assert dest == tmp_path / "Movies" / "Inception (2010)" / "Inception (2010).mkv"
+    assert "Should Not Appear" not in str(dest)
+    assert "Season" not in str(dest)
+
+
+def test_build_destination_unknown_unaffected_by_season_and_episode_title(tmp_path):
+    """No-metadata (Unknown) destinations must ignore season_num/episode_title
+    entirely, even when non-default values are passed."""
+    org = Organizer(tmp_path)
+    dest = org.build_destination(
+        None, "MY_DISC", episode_num=5, season_num=3, episode_title="Should Not Appear"
+    )
+    assert dest == tmp_path / "Unknown" / "MY_DISC.mkv"
+    assert "Should Not Appear" not in str(dest)
+    assert "Season" not in str(dest)
+
+
 def test_build_destination_no_metadata_uses_disc_label(tmp_path):
     org = Organizer(tmp_path)
     dest = org.build_destination(None, "MY_DISC")

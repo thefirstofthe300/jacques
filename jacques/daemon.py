@@ -296,8 +296,25 @@ async def _run_pipeline(
         else:
             log.info("Job %d: organizing %d file(s)", job_id, len(transcoded_paths))
 
+        episode_assignments: dict = {}
+        if disc_type_hint == DiscType.TV_SHOW:
+            async with AsyncSessionLocal() as db:
+                job = await db.get(Job, job_id)
+                if job is not None:
+                    episode_assignments = job.parsed_episode_assignments
+
         for i, path in enumerate(transcoded_paths):
-            dest = organizer.build_destination(media_info, disc_label, episode_num=i + 1)
+            if disc_type_hint == DiscType.TV_SHOW:
+                assignment = episode_assignments.get(path.parent.name, {})
+                dest = organizer.build_destination(
+                    media_info,
+                    disc_label,
+                    episode_num=assignment.get("episode", i + 1),
+                    season_num=assignment.get("season", 1),
+                    episode_title=assignment.get("name"),
+                )
+            else:
+                dest = organizer.build_destination(media_info, disc_label, episode_num=i + 1)
             await organizer.move(path, dest)
 
         shutil.rmtree(job_temp, ignore_errors=True)
