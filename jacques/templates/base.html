@@ -66,7 +66,9 @@
       alert('Please enter a valid TMDB ID');
       return;
     }
-    htmx.ajax('POST', '/api/jobs/' + jobId + '/select/' + tmdbId, {swap: 'none'});
+    const typeSelect = document.getElementById('tmdb-type-' + jobId);
+    const discType = typeSelect ? '?disc_type=' + typeSelect.value : '';
+    htmx.ajax('POST', '/api/jobs/' + jobId + '/select/' + tmdbId + discType, {swap: 'none'});
   }
 
   // Preserve input values across job-list innerHTML swaps.
@@ -77,8 +79,8 @@
     document.addEventListener('htmx:beforeSwap', function (e) {
       if (!e.detail.target || e.detail.target.id !== 'job-list') return;
       saved = {};
-      e.detail.target.querySelectorAll('input[id]').forEach(function (input) {
-        if (input.value !== '') saved[input.id] = input.value;
+      e.detail.target.querySelectorAll('input[id], select[id]').forEach(function (el) {
+        if (el.value !== '') saved[el.id] = el.value;
       });
     });
     document.addEventListener('htmx:afterSwap', function (e) {

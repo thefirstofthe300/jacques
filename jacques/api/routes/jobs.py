@@ -134,6 +134,7 @@ async def select_match(
     tmdb_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
+    disc_type: str | None = None,
 ) -> JSONResponse:
     job = await db.get(Job, job_id)
     if job is None:
@@ -154,7 +155,8 @@ async def select_match(
         disc_type = DiscType(candidate["disc_type"])
     else:
         try:
-            media_info = await MetadataService(settings.tmdb_api_key).lookup_by_id(tmdb_id, job.disc_type)
+            lookup_type = DiscType(disc_type) if disc_type else job.disc_type
+            media_info = await MetadataService(settings.tmdb_api_key).lookup_by_id(tmdb_id, lookup_type)
         except ValueError as e:
             log.warning("TMDB lookup failed for job %d, tmdb_id %d: %s", job_id, tmdb_id, e)
             raise HTTPException(status_code=404, detail="TMDB ID not found")
