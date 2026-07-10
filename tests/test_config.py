@@ -33,7 +33,7 @@ def test_settings_missing_toml_uses_defaults(monkeypatch, tmp_path):
     monkeypatch.delenv("JACQUES_HANDBRAKE_QUALITY", raising=False)
 
     s = Settings()
-    assert s.handbrake_quality == 20
+    assert s.handbrake_quality == 18
 
 
 def test_settings_loads_preset_from_toml(monkeypatch, tmp_path):
