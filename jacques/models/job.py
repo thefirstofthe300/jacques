@@ -17,6 +17,7 @@ class JobStatus(str, enum.Enum):
     COMPLETE = "complete"
     FAILED = "failed"
     AWAITING_SELECTION = "awaiting_selection"
+    DUPLICATE_DETECTED = "duplicate_detected"
 
 
 class DiscType(str, enum.Enum):
@@ -35,6 +36,7 @@ class Job(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     drive_path: Mapped[str] = mapped_column(String, nullable=False)
     disc_label: Mapped[str | None] = mapped_column(String)
+    disc_uuid: Mapped[str | None] = mapped_column(String)
     disc_type: Mapped[DiscType] = mapped_column(
         Enum(DiscType), default=DiscType.UNKNOWN, nullable=False
     )
@@ -67,6 +69,7 @@ class Job(Base):
             JobStatus.COMPLETE,
             JobStatus.FAILED,
             JobStatus.AWAITING_SELECTION,
+            JobStatus.DUPLICATE_DETECTED,
         )
 
     @property

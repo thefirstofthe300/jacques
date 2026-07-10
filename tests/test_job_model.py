@@ -25,11 +25,24 @@ from jacques.models.job import Job, JobStatus
         (JobStatus.COMPLETE, False),
         (JobStatus.FAILED, False),
         (JobStatus.AWAITING_SELECTION, False),
+        (JobStatus.DUPLICATE_DETECTED, False),
     ],
 )
 def test_is_active(status, expected):
     job = Job(drive_path="/dev/sr0", status=status)
     assert job.is_active is expected
+
+
+def test_is_active_false_for_duplicate_detected():
+    """DUPLICATE_DETECTED is explicitly excluded from active statuses."""
+    job = Job(drive_path="/dev/sr0", status=JobStatus.DUPLICATE_DETECTED)
+    assert job.is_active is False
+
+
+def test_is_active_true_for_ripping():
+    """Spot-check that a mid-pipeline status is still considered active."""
+    job = Job(drive_path="/dev/sr0", status=JobStatus.RIPPING)
+    assert job.is_active is True
 
 
 # ── parsed_candidates ─────────────────────────────────────────────────────────
@@ -62,3 +75,32 @@ def test_parsed_candidates_single_item_list():
     payload = [{"id": 42, "title": "Alien", "year": 1979}]
     job = Job(drive_path="/dev/sr0", candidates=json.dumps(payload))
     assert job.parsed_candidates == payload
+
+
+# ── disc_uuid field ───────────────────────────────────────────────────────────
+
+
+def test_disc_uuid_can_be_set():
+    """Job accepts a disc_uuid string on construction."""
+    uuid = "550e8400-e29b-41d4-a716-446655440000"
+    job = Job(drive_path="/dev/sr0", disc_uuid=uuid)
+    assert job.disc_uuid == uuid
+
+
+def test_disc_uuid_defaults_to_none():
+    """disc_uuid is nullable; omitting it leaves it as None (backward compat)."""
+    job = Job(drive_path="/dev/sr0")
+    assert job.disc_uuid is None
+
+
+# ── JobStatus enum serialization ──────────────────────────────────────────────
+
+
+def test_duplicate_detected_serializes_to_string():
+    """DUPLICATE_DETECTED's string value must be the literal 'duplicate_detected'.
+
+    JobStatus inherits from str, so equality comparison and .value are the
+    serialization paths used by SQLAlchemy and JSON responses.
+    """
+    assert JobStatus.DUPLICATE_DETECTED == "duplicate_detected"
+    assert JobStatus.DUPLICATE_DETECTED.value == "duplicate_detected"
