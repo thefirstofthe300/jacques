@@ -1,5 +1,6 @@
 import json
 import logging
+import shutil
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -186,6 +187,96 @@ async def select_match(
         await queue.put((job_id, JobStatus.TRANSCODING))
 
     return JSONResponse(status_code=202, content={"job_id": job_id, "tmdb_id": tmdb_id})
+
+
+class EpisodeAssignment(BaseModel):
+    title_id: int
+    season: int
+    episode: int
+    name: str
+
+
+@router.post("/{job_id}/assign-episodes", status_code=202)
+async def assign_episodes(
+    job_id: int,
+    body: list[EpisodeAssignment],
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    job = await db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status != JobStatus.AWAITING_EPISODE_ASSIGNMENT:
+        raise HTTPException(status_code=409, detail="Job is not awaiting episode assignment")
+
+    parsed_title_ids = {t["id"] for t in job.parsed_titles}
+    submitted_title_ids = {a.title_id for a in body}
+
+    if submitted_title_ids != parsed_title_ids:
+        missing = parsed_title_ids - submitted_title_ids
+        extra = submitted_title_ids - parsed_title_ids
+        detail_parts = []
+        if missing:
+            detail_parts.append(f"missing title_ids: {sorted(missing)}")
+        if extra:
+            detail_parts.append(f"unknown title_ids: {sorted(extra)}")
+        raise HTTPException(status_code=400, detail="; ".join(detail_parts))
+
+    job.episode_assignments = json.dumps({
+        str(a.title_id): {"season": a.season, "episode": a.episode, "name": a.name}
+        for a in body
+    })
+    job.status = JobStatus.TRANSCODING
+    job.progress = 0
+    job.error_message = None
+    await db.commit()
+
+    queue = getattr(request.app.state, "rerun_queue", None)
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    await queue.put((job_id, JobStatus.TRANSCODING))
+
+    return JSONResponse(status_code=202, content={"job_id": job_id, "assigned": len(body)})
+
+
+@router.post("/{job_id}/keep-title/{title_id}", status_code=202)
+async def keep_title(
+    job_id: int,
+    title_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    job = await db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status != JobStatus.AWAITING_TITLE_SELECTION:
+        raise HTTPException(status_code=409, detail="Job is not awaiting title selection")
+
+    parsed_title_ids = {t["id"] for t in job.parsed_titles}
+    if title_id not in parsed_title_ids:
+        raise HTTPException(status_code=400, detail=f"Unknown title_id {title_id}")
+
+    job.selected_title_id = title_id
+    job.status = JobStatus.TRANSCODING
+    job.progress = 0
+    job.error_message = None
+
+    for other_id in parsed_title_ids - {title_id}:
+        shutil.rmtree(
+            settings.temp_path / str(job_id) / "raw" / str(other_id),
+            ignore_errors=True,
+        )
+
+    await db.commit()
+
+    queue = getattr(request.app.state, "rerun_queue", None)
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    await queue.put((job_id, JobStatus.TRANSCODING))
+
+    return JSONResponse(status_code=202, content={"job_id": job_id, "title_id": title_id})
 
 
 @router.delete("/{job_id}", status_code=204)
