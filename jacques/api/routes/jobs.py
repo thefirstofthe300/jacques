@@ -143,11 +143,12 @@ async def select_match(
     if job.status not in selectable:
         raise HTTPException(status_code=409, detail="Job is not awaiting selection")
 
+    candidate: dict | None = None
     if job.candidates:
-        candidates = json.loads(job.candidates)
-        candidate = next((c for c in candidates if c["tmdb_id"] == tmdb_id), None)
-        if candidate is None:
-            raise HTTPException(status_code=404, detail="Candidate not found")
+        stored = json.loads(job.candidates)
+        candidate = next((c for c in stored if c["tmdb_id"] == tmdb_id), None)
+
+    if candidate is not None:
         title = candidate["title"]
         year = candidate["year"]
         disc_type = DiscType(candidate["disc_type"])

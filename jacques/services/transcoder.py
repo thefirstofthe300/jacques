@@ -85,5 +85,10 @@ class Transcoder:
             if stderr_task.done() and not stderr_task.cancelled():
                 with contextlib.suppress(Exception):
                     stderr_out = stderr_task.result().decode(errors="replace").strip()
+            # HandBrakeCLI 1.10.2 exits with 255 even on a successful encode on some
+            # Linux packaging setups. "Encode done!" only appears after a real completion.
+            if proc.returncode == 255 and "Encode done!" in stderr_out:
+                log.warning("HandBrakeCLI exited 255 but encode succeeded; treating as success")
+                return
             detail = f": {stderr_out}" if stderr_out else ""
             raise RuntimeError(f"HandBrakeCLI exited with code {proc.returncode}{detail}")

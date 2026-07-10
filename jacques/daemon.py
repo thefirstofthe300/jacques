@@ -343,6 +343,21 @@ async def _process_jobs(queue: asyncio.Queue[tuple[str, str | None]]) -> None:
             queue.task_done()
 
 
+async def _reset_interrupted_jobs() -> int:
+    """Mark in-progress jobs failed on startup. AWAITING_SELECTION is preserved."""
+    # AWAITING_SELECTION is a deliberate user-action pause — it survives daemon restarts.
+    preserved = {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.AWAITING_SELECTION}
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Job).where(Job.status.not_in(preserved)))
+        interrupted = result.scalars().all()
+        for job in interrupted:
+            job.status = JobStatus.FAILED
+            job.error_message = "Interrupted by daemon restart"
+        if interrupted:
+            await db.commit()
+    return len(interrupted)
+
+
 async def run() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -355,16 +370,9 @@ async def run() -> None:
     await init_db()
     log.info("Database initialized at %s", settings.db_path)
 
-    terminal = {JobStatus.COMPLETE, JobStatus.FAILED}
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(Job).where(Job.status.not_in(terminal)))
-        interrupted = result.scalars().all()
-        for job in interrupted:
-            job.status = JobStatus.FAILED
-            job.error_message = "Interrupted by daemon restart"
-        if interrupted:
-            await db.commit()
-            log.info("Marked %d interrupted job(s) as failed", len(interrupted))
+    count = await _reset_interrupted_jobs()
+    if count:
+        log.info("Marked %d interrupted job(s) as failed", count)
 
     job_queue: asyncio.Queue[tuple[str, str | None]] = asyncio.Queue()
     rerun_queue: asyncio.Queue[tuple[int, JobStatus]] = asyncio.Queue()
