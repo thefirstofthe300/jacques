@@ -391,7 +391,14 @@ async def _process_jobs(queue: asyncio.Queue[tuple[str, str | None, str | None]]
 async def _reset_interrupted_jobs() -> int:
     """Mark in-progress jobs failed on startup. AWAITING_SELECTION is preserved."""
     # AWAITING_SELECTION is a deliberate user-action pause — it survives daemon restarts.
-    preserved = {JobStatus.COMPLETE, JobStatus.FAILED, JobStatus.AWAITING_SELECTION, JobStatus.DUPLICATE_DETECTED}
+    preserved = {
+        JobStatus.COMPLETE,
+        JobStatus.FAILED,
+        JobStatus.AWAITING_SELECTION,
+        JobStatus.DUPLICATE_DETECTED,
+        JobStatus.AWAITING_EPISODE_ASSIGNMENT,
+        JobStatus.AWAITING_TITLE_SELECTION,
+    }
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(Job).where(Job.status.not_in(preserved)))
         interrupted = result.scalars().all()

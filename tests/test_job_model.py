@@ -26,6 +26,8 @@ from jacques.models.job import Job, JobStatus
         (JobStatus.FAILED, False),
         (JobStatus.AWAITING_SELECTION, False),
         (JobStatus.DUPLICATE_DETECTED, False),
+        (JobStatus.AWAITING_EPISODE_ASSIGNMENT, False),
+        (JobStatus.AWAITING_TITLE_SELECTION, False),
     ],
 )
 def test_is_active(status, expected):
@@ -36,6 +38,18 @@ def test_is_active(status, expected):
 def test_is_active_false_for_duplicate_detected():
     """DUPLICATE_DETECTED is explicitly excluded from active statuses."""
     job = Job(drive_path="/dev/sr0", status=JobStatus.DUPLICATE_DETECTED)
+    assert job.is_active is False
+
+
+def test_is_active_false_for_awaiting_episode_assignment():
+    """AWAITING_EPISODE_ASSIGNMENT is a user-action pause, not an active status."""
+    job = Job(drive_path="/dev/sr0", status=JobStatus.AWAITING_EPISODE_ASSIGNMENT)
+    assert job.is_active is False
+
+
+def test_is_active_false_for_awaiting_title_selection():
+    """AWAITING_TITLE_SELECTION is a user-action pause, not an active status."""
+    job = Job(drive_path="/dev/sr0", status=JobStatus.AWAITING_TITLE_SELECTION)
     assert job.is_active is False
 
 
@@ -75,6 +89,54 @@ def test_parsed_candidates_single_item_list():
     payload = [{"id": 42, "title": "Alien", "year": 1979}]
     job = Job(drive_path="/dev/sr0", candidates=json.dumps(payload))
     assert job.parsed_candidates == payload
+
+
+# ── parsed_titles ─────────────────────────────────────────────────────────────
+
+
+def test_parsed_titles_none_returns_empty_list():
+    job = Job(drive_path="/dev/sr0", titles_json=None)
+    assert job.parsed_titles == []
+
+
+def test_parsed_titles_empty_string_returns_empty_list():
+    """An empty string is falsy; parsed_titles should return [] not raise."""
+    job = Job(drive_path="/dev/sr0", titles_json="")
+    assert job.parsed_titles == []
+
+
+def test_parsed_titles_deserializes_json():
+    payload = [
+        {"id": 0, "name": "Title 0", "duration_seconds": 5400, "expected_bytes": None},
+        {"id": 1, "name": "Title 1", "duration_seconds": 1200, "expected_bytes": None},
+    ]
+    job = Job(drive_path="/dev/sr0", titles_json=json.dumps(payload))
+    result = job.parsed_titles
+    assert result == payload
+    assert isinstance(result, list)
+    assert result[0]["name"] == "Title 0"
+
+
+# ── parsed_episode_assignments ─────────────────────────────────────────────────
+
+
+def test_parsed_episode_assignments_none_returns_empty_dict():
+    job = Job(drive_path="/dev/sr0", episode_assignments=None)
+    assert job.parsed_episode_assignments == {}
+
+
+def test_parsed_episode_assignments_empty_string_returns_empty_dict():
+    """An empty string is falsy; parsed_episode_assignments should return {} not raise."""
+    job = Job(drive_path="/dev/sr0", episode_assignments="")
+    assert job.parsed_episode_assignments == {}
+
+
+def test_parsed_episode_assignments_deserializes_json():
+    payload = {"0": 1, "1": 2, "2": 3}
+    job = Job(drive_path="/dev/sr0", episode_assignments=json.dumps(payload))
+    result = job.parsed_episode_assignments
+    assert result == payload
+    assert isinstance(result, dict)
 
 
 # ── disc_uuid field ───────────────────────────────────────────────────────────

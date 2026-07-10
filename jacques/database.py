@@ -27,6 +27,14 @@ async def init_db() -> None:
         if "disc_uuid" not in {row[1] for row in result}:
             await conn.execute(text("ALTER TABLE jobs ADD COLUMN disc_uuid TEXT"))
 
+        # Migrate existing databases: add episode_assignments/selected_title_id to jobs if not present.
+        result = await conn.execute(text("PRAGMA table_info(jobs)"))
+        existing_columns = {row[1] for row in result}
+        if "episode_assignments" not in existing_columns:
+            await conn.execute(text("ALTER TABLE jobs ADD COLUMN episode_assignments TEXT"))
+        if "selected_title_id" not in existing_columns:
+            await conn.execute(text("ALTER TABLE jobs ADD COLUMN selected_title_id INTEGER"))
+
     # One-time backfill: seed ripped_discs from existing COMPLETE jobs.
     # Safe to run on every startup — skips any disc_label that already has a row.
     from .models.job import Job, JobStatus

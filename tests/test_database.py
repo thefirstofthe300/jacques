@@ -9,12 +9,13 @@ then calls init_db() with the module-level `engine` and `AsyncSessionLocal`
 patched to point at that same engine.  After the call, we inspect ripped_discs
 using the same session factory.
 """
+import json
 from datetime import datetime, timezone
 from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -231,3 +232,111 @@ async def test_complete_job_with_uuid_only_creates_ripped_disc(backfill_db):
     assert disc.disc_uuid == "some-uuid-123"
     assert disc.disc_label is None
     assert disc.job_id == job.id
+
+
+# ── jobs table column migrations ───────────────────────────────────────────────
+#
+# create_all() only creates brand-new tables; it never adds columns to a table
+# that already exists. So init_db() also runs a PRAGMA table_info(jobs) +
+# conditional ALTER TABLE for each column added after the jobs table already
+# shipped (disc_uuid, and now episode_assignments/selected_title_id). These
+# tests simulate an "old" on-disk schema — created via create_all() and then
+# stripped of the newer columns via DROP COLUMN — to exercise the ALTER TABLE
+# path rather than the create_all path.
+
+
+@pytest_asyncio.fixture
+async def legacy_jobs_db():
+    """Fresh engine whose jobs table predates episode_assignments/selected_title_id.
+
+    Built by creating the current schema and then dropping the two columns,
+    so everything else about the table (types, other columns) matches
+    production and only the migration target columns are missing.
+    """
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("ALTER TABLE jobs DROP COLUMN episode_assignments"))
+        await conn.execute(text("ALTER TABLE jobs DROP COLUMN selected_title_id"))
+    factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    yield engine, factory
+    await engine.dispose()
+
+
+async def _table_columns(engine) -> set[str]:
+    async with engine.begin() as conn:
+        result = await conn.execute(text("PRAGMA table_info(jobs)"))
+        return {row[1] for row in result}
+
+
+async def test_legacy_schema_is_missing_new_columns(legacy_jobs_db):
+    """Sanity check on the fixture itself: confirms it actually reproduces the
+    pre-migration schema before any test relies on that assumption."""
+    engine, _ = legacy_jobs_db
+    columns = await _table_columns(engine)
+    assert "episode_assignments" not in columns
+    assert "selected_title_id" not in columns
+
+
+async def test_init_db_adds_episode_assignments_and_selected_title_id_columns(
+    legacy_jobs_db,
+):
+    """init_db() ALTER TABLEs both new columns onto an existing jobs table."""
+    engine, factory = legacy_jobs_db
+
+    await _run_init_db(engine, factory)
+
+    columns = await _table_columns(engine)
+    assert "episode_assignments" in columns
+    assert "selected_title_id" in columns
+
+
+async def test_migrated_columns_are_usable_via_orm(legacy_jobs_db):
+    """The migrated columns aren't just present in the schema — they round-trip
+    real values through the ORM."""
+    engine, factory = legacy_jobs_db
+    await _run_init_db(engine, factory)
+
+    payload = json.dumps({"0": 1, "1": 2})
+    async with factory() as session:
+        job = Job(
+            drive_path="/dev/sr0",
+            episode_assignments=payload,
+            selected_title_id=7,
+        )
+        session.add(job)
+        await session.commit()
+        job_id = job.id
+
+    async with factory() as session:
+        fetched = await session.get(Job, job_id)
+        assert fetched.episode_assignments == payload
+        assert fetched.selected_title_id == 7
+
+
+async def test_init_db_migration_is_idempotent_across_multiple_calls(legacy_jobs_db):
+    """Regression test for the two migration blocks sharing a variable name.
+
+    Both the disc_uuid migration and the episode_assignments/selected_title_id
+    migration read `result = await conn.execute(text("PRAGMA table_info(jobs)"))`
+    and then inspect it. A SQLAlchemy CursorResult is single-use: iterating it
+    once (e.g. building the `{row[1] for row in result}` set) exhausts it. If a
+    later edit made the second migration block reuse the first block's already
+    consumed `result`/set instead of issuing its own fresh PRAGMA query, that
+    block would see an empty column set on every call — so on the second (and
+    every subsequent) init_db() call it would try to ALTER TABLE ADD COLUMN a
+    column that already exists and crash with "duplicate column name".
+
+    Calling init_db() repeatedly on the same engine reproduces exactly that
+    scenario: this test fails loudly under the buggy behavior instead of
+    passing "by accident" the way a single-call test would.
+    """
+    engine, factory = legacy_jobs_db
+
+    await _run_init_db(engine, factory)
+    await _run_init_db(engine, factory)
+    await _run_init_db(engine, factory)
+
+    columns = await _table_columns(engine)
+    assert "episode_assignments" in columns
+    assert "selected_title_id" in columns

@@ -18,6 +18,8 @@ class JobStatus(str, enum.Enum):
     FAILED = "failed"
     AWAITING_SELECTION = "awaiting_selection"
     DUPLICATE_DETECTED = "duplicate_detected"
+    AWAITING_EPISODE_ASSIGNMENT = "awaiting_episode_assignment"
+    AWAITING_TITLE_SELECTION = "awaiting_title_selection"
 
 
 class DiscType(str, enum.Enum):
@@ -50,6 +52,8 @@ class Job(Base):
     error_message: Mapped[str | None] = mapped_column(String)
     candidates: Mapped[str | None] = mapped_column(String)
     titles_json: Mapped[str | None] = mapped_column(String)
+    episode_assignments: Mapped[str | None] = mapped_column(String)
+    selected_title_id: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, nullable=False
     )
@@ -70,6 +74,8 @@ class Job(Base):
             JobStatus.FAILED,
             JobStatus.AWAITING_SELECTION,
             JobStatus.DUPLICATE_DETECTED,
+            JobStatus.AWAITING_EPISODE_ASSIGNMENT,
+            JobStatus.AWAITING_TITLE_SELECTION,
         )
 
     @property
@@ -78,3 +84,17 @@ class Job(Base):
             return []
         import json
         return json.loads(self.candidates)
+
+    @property
+    def parsed_titles(self) -> list[dict]:
+        if not self.titles_json:
+            return []
+        import json
+        return json.loads(self.titles_json)
+
+    @property
+    def parsed_episode_assignments(self) -> dict:
+        if not self.episode_assignments:
+            return {}
+        import json
+        return json.loads(self.episode_assignments)
