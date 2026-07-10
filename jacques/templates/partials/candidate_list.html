@@ -1,0 +1,26 @@
+{% if candidates %}
+<div class="d-flex flex-column gap-2">
+  {% for cand in candidates %}
+  <div class="d-flex justify-content-between align-items-start border border-secondary rounded p-2">
+    <div class="flex-grow-1 me-2">
+      <div class="fw-semibold small">
+        {{ cand.title }}{% if cand.year %} <span class="text-muted fw-normal">({{ cand.year }})</span>{% endif %}
+        <span class="badge bg-secondary ms-1 fw-normal" style="font-size:0.65rem">
+          {% if cand.disc_type == "tv_show" %}<i class="bi bi-tv me-1"></i>TV{% else %}<i class="bi bi-camera-film me-1"></i>Movie{% endif %}
+        </span>
+      </div>
+      {% if cand.overview %}
+      <div class="text-muted" style="font-size:0.75rem">{{ cand.overview }}</div>
+      {% endif %}
+    </div>
+    <button class="btn btn-sm btn-outline-primary flex-shrink-0"
+            hx-post="/api/jobs/{{ job_id }}/select/{{ cand.tmdb_id }}?disc_type={{ cand.disc_type }}"
+            hx-swap="none">
+      Select
+    </button>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="text-muted small py-2">No results found.</div>
+{% endif %}

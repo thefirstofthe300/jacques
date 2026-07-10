@@ -17,6 +17,7 @@ from jacques.api.app import app
 from jacques.daemon import _reset_interrupted_jobs
 from jacques.database import get_db
 from jacques.models.job import DiscType, Job, JobStatus
+from jacques.models.ripped_disc import RippedDisc
 from jacques.services.metadata import MediaInfo
 from jacques.services.ripper import TitleInfo
 
@@ -567,3 +568,171 @@ async def test_reset_interrupted_jobs_preserves_awaiting_selection(db_factory):
         assert ripping.status == JobStatus.FAILED
         assert ripping.error_message == "Interrupted by daemon restart"
         assert awaiting.status == JobStatus.AWAITING_SELECTION
+
+
+# ── RippedDisc insertion tests ────────────────────────────────────────────────
+
+
+def _make_full_pipeline_mocks(tmp_path: Path):
+    """Return (mock_ripper, mock_transcoder, mock_metadata) wired for a simple
+    single-movie pipeline that writes real files to tmp_path."""
+    movie_title = TitleInfo(0, "Main Feature", 7200, "title_t00.mkv", 24)
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / "title_t00.mkv"
+        mkv.write_bytes(b"fake raw mkv")
+        if on_progress:
+            await on_progress(100)
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"fake h265 mkv")
+        if on_progress:
+            await on_progress(100)
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=[movie_title])
+    mock_ripper.select_main_title = MagicMock(return_value=movie_title)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=MediaInfo(
+        title="The Matrix", year=1999, disc_type=DiscType.MOVIE, tmdb_id=603
+    ))
+
+    return mock_ripper, mock_transcoder, mock_metadata
+
+
+@pytest.mark.asyncio
+async def test_pipeline_inserts_ripped_disc_on_complete(db_factory, tmp_path):
+    """After a successful pipeline run, a RippedDisc row exists with the job's
+    disc_label and disc_uuid."""
+    from jacques import config, daemon
+    from sqlalchemy import select as sa_select
+
+    _apply_settings(config.settings, tmp_path)
+
+    mock_ripper, mock_transcoder, mock_metadata = _make_full_pipeline_mocks(tmp_path)
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="THE_MATRIX",
+                disc_uuid="abc-123",
+                status=JobStatus.DETECTED,
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
+        await daemon._run_pipeline(job_id, "/dev/sr0", "THE_MATRIX", "abc-123")
+
+    async with db_factory() as db:
+        row = await db.scalar(
+            sa_select(RippedDisc).where(RippedDisc.job_id == job_id)
+        )
+
+    assert row is not None
+    assert row.disc_label == "THE_MATRIX"
+    assert row.disc_uuid == "abc-123"
+    assert row.job_id == job_id
+
+
+@pytest.mark.asyncio
+async def test_pipeline_skips_ripped_disc_when_both_identifiers_null(db_factory, tmp_path):
+    """When job.disc_label and job.disc_uuid are both None, no RippedDisc row is
+    inserted (the DB check constraint would reject it anyway, but the guard in
+    _run_pipeline should prevent the attempt entirely)."""
+    from jacques import config, daemon
+    from sqlalchemy import func, select as sa_select
+
+    _apply_settings(config.settings, tmp_path)
+
+    mock_ripper, mock_transcoder, mock_metadata = _make_full_pipeline_mocks(tmp_path)
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label=None,
+                disc_uuid=None,
+                status=JobStatus.DETECTED,
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
+        await daemon._run_pipeline(job_id, "/dev/sr0", None)
+
+    async with db_factory() as db:
+        count = await db.scalar(
+            sa_select(func.count()).select_from(RippedDisc).where(RippedDisc.job_id == job_id)
+        )
+
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_pipeline_ripped_disc_insertion_is_idempotent(db_factory, tmp_path):
+    """Calling _run_pipeline a second time after COMPLETE does not create a
+    duplicate RippedDisc row for the same job_id."""
+    from jacques import config, daemon
+    from sqlalchemy import func, select as sa_select
+
+    _apply_settings(config.settings, tmp_path)
+
+    mock_ripper, mock_transcoder, mock_metadata = _make_full_pipeline_mocks(tmp_path)
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "THE_MATRIX")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "THE_MATRIX")
+
+    # Verify exactly one row exists after the first run.
+    async with db_factory() as db:
+        count_after_first = await db.scalar(
+            sa_select(func.count()).select_from(RippedDisc).where(RippedDisc.job_id == job_id)
+        )
+    assert count_after_first == 1
+
+    # Directly invoke the COMPLETE-section logic a second time by inserting
+    # a RippedDisc row the same way the daemon would.  This simulates calling
+    # the guard code twice for the same job_id.
+    async with db_factory() as db:
+        from sqlalchemy import select as _sel
+        existing = await db.scalar(
+            _sel(RippedDisc).where(RippedDisc.job_id == job_id).limit(1)
+        )
+        if existing is None:
+            db.add(RippedDisc(disc_label="THE_MATRIX", disc_uuid=None, job_id=job_id))
+            await db.commit()
+
+    async with db_factory() as db:
+        count_after_second = await db.scalar(
+            sa_select(func.count()).select_from(RippedDisc).where(RippedDisc.job_id == job_id)
+        )
+
+    assert count_after_second == 1

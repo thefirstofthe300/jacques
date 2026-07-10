@@ -90,6 +90,16 @@ class MetadataService:
 
         return candidates
 
+    async def search(self, disc_label: str, disc_type: DiscType) -> list[MediaInfo]:
+        """Search TMDB for disc_label restricted to the given disc_type."""
+        if not self._api_key:
+            return []
+        query = _normalize_label(disc_label)
+        async with httpx.AsyncClient() as client:
+            if disc_type == DiscType.TV_SHOW:
+                return await self._search_tv(client, query)
+            return await self._search_movie(client, query)
+
     async def lookup_by_id(self, tmdb_id: int, disc_type: DiscType) -> MediaInfo:
         """Fetch metadata for a specific TMDb ID.
 

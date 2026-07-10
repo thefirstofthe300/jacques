@@ -535,7 +535,7 @@ async def test_process_reruns_dispatches_pipeline(db_factory, tmp_path):
 
     pipeline_calls: list = []
 
-    async def fake_pipeline(job_id, drive_path, disc_label, start_stage):
+    async def fake_pipeline(job_id, drive_path, disc_label, disc_uuid, start_stage):
         pipeline_calls.append((job_id, start_stage))
 
     job_id = await _create_job(

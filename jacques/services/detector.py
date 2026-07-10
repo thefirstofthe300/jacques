@@ -6,13 +6,13 @@ import pyudev
 
 log = logging.getLogger(__name__)
 
-OnDiscInserted = Callable[[str, str | None], Awaitable[None]]
+OnDiscInserted = Callable[[str, str | None, str | None], Awaitable[None]]
 
 
 class DiscDetector:
     """Monitors udev for optical disc insertion events.
 
-    Calls on_disc_inserted(drive_path, disc_label) for each detected disc.
+    Calls on_disc_inserted(drive_path, disc_label, disc_uuid) for each detected disc.
     Runs until the asyncio task is cancelled.
     """
 
@@ -33,8 +33,9 @@ class DiscDetector:
                 continue
             drive_path: str = device.device_node
             disc_label: str | None = device.get("ID_FS_LABEL") or None
-            log.info("Disc already present: %s (label=%r)", drive_path, disc_label)
-            await self._on_disc_inserted(drive_path, disc_label)
+            disc_uuid: str | None = device.get("ID_FS_UUID") or None
+            log.info("Disc already present: %s (label=%r, uuid=%r)", drive_path, disc_label, disc_uuid)
+            await self._on_disc_inserted(drive_path, disc_label, disc_uuid)
 
         while True:
             device: pyudev.Device | None = await asyncio.get_running_loop().run_in_executor(
@@ -55,6 +56,7 @@ class DiscDetector:
 
             drive_path: str = device.device_node
             disc_label: str | None = device.get("ID_FS_LABEL") or None
+            disc_uuid: str | None = device.get("ID_FS_UUID") or None
 
-            log.info("Disc inserted: %s (label=%r)", drive_path, disc_label)
-            await self._on_disc_inserted(drive_path, disc_label)
+            log.info("Disc inserted: %s (label=%r, uuid=%r)", drive_path, disc_label, disc_uuid)
+            await self._on_disc_inserted(drive_path, disc_label, disc_uuid)

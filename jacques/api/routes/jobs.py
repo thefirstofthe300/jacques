@@ -28,6 +28,7 @@ class JobResponse(BaseModel):
     id: int
     drive_path: str
     disc_label: str | None
+    disc_uuid: str | None
     disc_type: str
     status: str
     title: str | None
@@ -47,6 +48,7 @@ class JobResponse(BaseModel):
             id=job.id,
             drive_path=job.drive_path,
             disc_label=job.disc_label,
+            disc_uuid=job.disc_uuid,
             disc_type=job.disc_type.value,
             status=job.status.value,
             title=job.title,
@@ -134,6 +136,7 @@ async def select_match(
     tmdb_id: int,
     request: Request,
     db: AsyncSession = Depends(get_db),
+    disc_type: str | None = None,
 ) -> JSONResponse:
     job = await db.get(Job, job_id)
     if job is None:
@@ -154,7 +157,8 @@ async def select_match(
         disc_type = DiscType(candidate["disc_type"])
     else:
         try:
-            media_info = await MetadataService(settings.tmdb_api_key).lookup_by_id(tmdb_id, job.disc_type)
+            lookup_type = DiscType(disc_type) if disc_type else job.disc_type
+            media_info = await MetadataService(settings.tmdb_api_key).lookup_by_id(tmdb_id, lookup_type)
         except ValueError as e:
             log.warning("TMDB lookup failed for job %d, tmdb_id %d: %s", job_id, tmdb_id, e)
             raise HTTPException(status_code=404, detail="TMDB ID not found")
@@ -182,3 +186,46 @@ async def select_match(
         await queue.put((job_id, JobStatus.TRANSCODING))
 
     return JSONResponse(status_code=202, content={"job_id": job_id, "tmdb_id": tmdb_id})
+
+
+@router.delete("/{job_id}", status_code=204)
+async def delete_job(
+    job_id: int,
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    job = await db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.is_active:
+        raise HTTPException(status_code=409, detail="Cannot delete an active job")
+
+    await db.delete(job)
+    await db.commit()
+
+
+@router.post("/{job_id}/rerip", status_code=202)
+async def rerip_job(
+    job_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> JSONResponse:
+    job = await db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.status != JobStatus.DUPLICATE_DETECTED:
+        raise HTTPException(status_code=409, detail="Job is not a duplicate")
+
+    queue = getattr(request.app.state, "rerun_queue", None)
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    job.status = JobStatus.IDENTIFYING
+    job.progress = 0
+    job.error_message = None
+    await db.commit()
+
+    await queue.put((job_id, JobStatus.IDENTIFYING))
+
+    return JSONResponse(status_code=202, content={"job_id": job_id})
