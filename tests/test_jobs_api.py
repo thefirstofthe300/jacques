@@ -547,3 +547,150 @@ async def test_select_match_tmdb_id_not_in_candidates_falls_through(api_client, 
     assert job.tmdb_id == 9659
     assert job.candidates is None
     assert job.status == JobStatus.TRANSCODING
+
+
+# ── DELETE /api/jobs/{job_id} ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_delete_204_complete_job(api_client, db_factory):
+    """DELETE on a COMPLETE job returns 204 and removes the row from the DB."""
+    job_id = await _create_job(db_factory, status=JobStatus.COMPLETE, error_message=None, progress=100)
+
+    response = await api_client.delete(f"/api/jobs/{job_id}")
+
+    assert response.status_code == 204
+    assert await _get_job(db_factory, job_id) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_204_failed_job(api_client, db_factory):
+    """DELETE on a FAILED job returns 204 and removes the row from the DB."""
+    job_id = await _create_job(db_factory, status=JobStatus.FAILED)
+
+    response = await api_client.delete(f"/api/jobs/{job_id}")
+
+    assert response.status_code == 204
+    assert await _get_job(db_factory, job_id) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_204_duplicate_detected_job(api_client, db_factory):
+    """DELETE on a DUPLICATE_DETECTED job returns 204 and removes the row from the DB."""
+    job_id = await _create_job(
+        db_factory, status=JobStatus.DUPLICATE_DETECTED, error_message=None
+    )
+
+    response = await api_client.delete(f"/api/jobs/{job_id}")
+
+    assert response.status_code == 204
+    assert await _get_job(db_factory, job_id) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_409_active_job(api_client, db_factory):
+    """DELETE on a RIPPING (active) job returns 409."""
+    job_id = await _create_job(db_factory, status=JobStatus.RIPPING, error_message=None)
+
+    response = await api_client.delete(f"/api/jobs/{job_id}")
+
+    assert response.status_code == 409
+    assert "active" in response.json()["detail"].lower()
+    # Job must still exist
+    assert await _get_job(db_factory, job_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_404_job_not_found(api_client):
+    """DELETE on a non-existent job_id returns 404."""
+    response = await api_client.delete("/api/jobs/99999")
+
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()
+
+
+# ── POST /api/jobs/{job_id}/rerip ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerip_202_duplicate_detected(api_client, db_factory, mock_queue):
+    """rerip on a DUPLICATE_DETECTED job:
+    - 202 response with job_id
+    - DB: status=IDENTIFYING, progress=0, error_message=None
+    - Queue receives (job_id, JobStatus.IDENTIFYING)
+    """
+    job_id = await _create_job(
+        db_factory,
+        status=JobStatus.DUPLICATE_DETECTED,
+        progress=50,
+        error_message="duplicate disc",
+    )
+
+    response = await api_client.post(f"/api/jobs/{job_id}/rerip")
+
+    assert response.status_code == 202
+    assert response.json()["job_id"] == job_id
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.IDENTIFYING
+    assert job.progress == 0
+    assert job.error_message is None
+
+    assert not mock_queue.empty()
+    enqueued = mock_queue.get_nowait()
+    assert enqueued == (job_id, JobStatus.IDENTIFYING)
+
+
+@pytest.mark.asyncio
+async def test_rerip_409_wrong_status(api_client, db_factory):
+    """rerip on a job that is not DUPLICATE_DETECTED returns 409."""
+    job_id = await _create_job(db_factory, status=JobStatus.FAILED)
+
+    response = await api_client.post(f"/api/jobs/{job_id}/rerip")
+
+    assert response.status_code == 409
+    assert "duplicate" in response.json()["detail"].lower()
+
+    # Job status must be unchanged
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_rerip_404_job_not_found(api_client):
+    """rerip on a non-existent job_id returns 404."""
+    response = await api_client.post("/api/jobs/99999/rerip")
+
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_rerip_503_no_rerun_queue(db_factory):
+    """If rerun_queue is absent from app.state, rerip returns 503 instead of
+    raising AttributeError."""
+    async def _override_get_db():
+        async with db_factory() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = _override_get_db
+    if hasattr(app.state, "rerun_queue"):
+        del app.state.rerun_queue
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            job_id = await _create_job(
+                db_factory,
+                status=JobStatus.DUPLICATE_DETECTED,
+                error_message=None,
+            )
+            response = await client.post(f"/api/jobs/{job_id}/rerip")
+
+        assert response.status_code == 503
+        assert "not ready" in response.json()["detail"].lower()
+    finally:
+        app.dependency_overrides.clear()
+        if hasattr(app.state, "rerun_queue"):
+            del app.state.rerun_queue
