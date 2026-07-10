@@ -8,10 +8,9 @@
 </div>
 
 <div id="job-list"
-     hx-ext="morph"
      hx-get="/partials/jobs"
      hx-trigger="every 3s"
-     hx-swap="morph:innerHTML">
+     hx-swap="innerHTML">
   {% include "partials/job_list.html" %}
 </div>
 {% endblock %}
