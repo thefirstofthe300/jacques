@@ -136,6 +136,7 @@ async def _run_pipeline(
     resume_transcoded: list[Path] = []
     prior_job_id: int | None = None
     candidates_stored: bool = False
+    selected_title_id: int | None = None
 
     if not _should_run(JobStatus.IDENTIFYING, start_stage):
         async with AsyncSessionLocal() as db:
@@ -261,6 +262,7 @@ async def _run_pipeline(
                     and disc_type_hint == DiscType.MOVIE
                     and job.selected_title_id is None
                 )
+                selected_title_id = job.selected_title_id if job is not None else None
             if pending_episode_assignment:
                 await _update_job(job_id, status=JobStatus.AWAITING_EPISODE_ASSIGNMENT)
                 log.info("Job %d: ripping complete, awaiting episode assignment before transcode", job_id)
@@ -269,6 +271,13 @@ async def _run_pipeline(
                 await _update_job(job_id, status=JobStatus.AWAITING_TITLE_SELECTION)
                 log.info("Job %d: ripping complete, awaiting title selection before transcode", job_id)
                 return
+
+        # Enforce the "keep one" invariant in the pipeline itself: once a title has
+        # been selected for an ambiguous movie disc, only that title's raw file may
+        # proceed to transcode/organize — regardless of whether keep_title's cleanup
+        # of the discarded titles' raw directories actually succeeded on disk.
+        if disc_type_hint == DiscType.MOVIE and selected_title_id is not None:
+            raw_paths = [p for p in raw_paths if p.parent.name == str(selected_title_id)]
 
         # ── TRANSCODING (skipped if resuming from transcoded output) ───────────
         if _should_run(JobStatus.TRANSCODING, start_stage):

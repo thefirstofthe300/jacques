@@ -264,10 +264,13 @@ async def keep_title(
     job.error_message = None
 
     for other_id in parsed_title_ids - {title_id}:
-        shutil.rmtree(
-            settings.temp_path / str(job_id) / "raw" / str(other_id),
-            ignore_errors=True,
-        )
+        other_dir = settings.temp_path / str(job_id) / "raw" / str(other_id)
+        try:
+            shutil.rmtree(other_dir)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            log.warning("Job %d: failed to clean up discarded title %s raw output: %s", job_id, other_id, exc)
 
     await db.commit()
 

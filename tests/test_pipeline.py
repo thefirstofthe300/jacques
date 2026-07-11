@@ -915,8 +915,111 @@ async def test_pipeline_skips_title_selection_pause_when_already_selected(db_fac
 
     job = await _get_job(db_factory, job_id)
     assert job.status == JobStatus.COMPLETE
-    # Both ripped titles were transcoded — the pause did not short-circuit the run.
-    assert len(transcode_calls) == 2
+    # Only the selected title's raw file was transcoded — the pipeline's own
+    # raw_paths filter enforces this even though title 1's raw directory
+    # still exists on disk (keep_title's cleanup is not involved here).
+    assert len(transcode_calls) == 1
+    assert transcode_calls[0].parent.name == "0"
+    assert transcode_calls[0].name == "t00.mkv"
+
+
+@pytest.mark.asyncio
+async def test_keep_title_endpoint_then_resume_organizes_only_kept_title(
+    db_factory, api_client, tmp_path
+):
+    """End-to-end seam test between the real POST /keep-title endpoint (which
+    deletes the discarded titles' raw subdirs) and the pipeline's resume-from-
+    TRANSCODING behavior (which independently filters raw_paths to the selected
+    title). These two mechanisms were previously only ever tested in isolation.
+
+    Sets up an ambiguous movie disc with 3 candidate titles, each ripped into its
+    own raw_dir/{title_id}/ subdirectory with distinguishable byte content. Drives
+    the job through the real pipeline to AWAITING_TITLE_SELECTION, calls the real
+    keep-title route to keep title 1, then resumes _run_pipeline at TRANSCODING
+    and asserts the organized output's content matches title 1 specifically."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    candidates = [
+        TitleInfo(0, "Title A", 7200, "t00.mkv", 1),
+        TitleInfo(1, "Title B", 6900, "t01.mkv", 1),
+        TitleInfo(2, "Title C", 6600, "t02.mkv", 1),
+    ]
+    raw_content = {0: b"A" * 1000, 1: b"B" * 2000, 2: b"C" * 500}
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(raw_content[title_id])
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(input_path.read_bytes())
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=candidates)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.has_ambiguous_main_feature = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(return_value=MediaInfo(
+        title="Ambiguous Movie", year=2021, disc_type=DiscType.MOVIE, tmdb_id=42
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "AMBIGUOUS_MOVIE")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "AMBIGUOUS_MOVIE")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.AWAITING_TITLE_SELECTION
+
+    raw_dir = config.settings.temp_path / str(job_id) / "raw"
+    assert {p.name for p in raw_dir.iterdir() if p.is_dir()} == {"0", "1", "2"}
+
+    # Drive the REAL keep-title route — not a reimplementation of its logic.
+    response = await api_client.post(f"/api/jobs/{job_id}/keep-title/1")
+    assert response.status_code == 202
+
+    job = await _get_job(db_factory, job_id)
+    assert job.selected_title_id == 1
+    assert job.status == JobStatus.TRANSCODING
+
+    # keep_title's own cleanup already removed the discarded titles' raw dirs.
+    assert not (raw_dir / "0").exists()
+    assert (raw_dir / "1").exists()
+    assert not (raw_dir / "2").exists()
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+    ):
+        await daemon._run_pipeline(
+            job_id, "/dev/sr0", "AMBIGUOUS_MOVIE", start_stage=JobStatus.TRANSCODING
+        )
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+
+    organized = (
+        tmp_path / "library" / "Movies" / "Ambiguous Movie (2021)"
+        / "Ambiguous Movie (2021).mkv"
+    )
+    assert organized.exists()
+    # Content attribution matches the KEPT title specifically, not merely "a" file.
+    assert organized.read_bytes() == raw_content[1]
+    assert organized.read_bytes() != raw_content[0]
+    assert organized.read_bytes() != raw_content[2]
 
 
 @pytest.mark.asyncio
