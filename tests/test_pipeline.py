@@ -1687,6 +1687,72 @@ async def test_reset_interrupted_jobs_preserves_awaiting_selection(db_factory):
         assert awaiting.status == JobStatus.AWAITING_SELECTION
 
 
+@pytest.mark.asyncio
+async def test_reset_interrupted_jobs_preserves_awaiting_episode_assignment(db_factory):
+    """AWAITING_EPISODE_ASSIGNMENT jobs must survive a daemon restart unchanged,
+    since the user still needs to assign episodes before the pipeline can resume."""
+    async with db_factory() as db:
+        ripping_job = Job(drive_path="/dev/sr0", disc_label="A", status=JobStatus.RIPPING)
+        awaiting_job = Job(
+            drive_path="/dev/sr1",
+            disc_label="B",
+            status=JobStatus.AWAITING_EPISODE_ASSIGNMENT,
+            candidates="[]",
+        )
+        db.add_all([ripping_job, awaiting_job])
+        await db.commit()
+        await db.refresh(ripping_job)
+        await db.refresh(awaiting_job)
+        ripping_id = ripping_job.id
+        awaiting_id = awaiting_job.id
+
+    with patch("jacques.daemon.AsyncSessionLocal", db_factory):
+        count = await _reset_interrupted_jobs()
+
+    assert count == 1
+
+    async with db_factory() as db:
+        ripping = await db.get(Job, ripping_id)
+        awaiting = await db.get(Job, awaiting_id)
+        assert ripping.status == JobStatus.FAILED
+        assert ripping.error_message == "Interrupted by daemon restart"
+        assert awaiting.status == JobStatus.AWAITING_EPISODE_ASSIGNMENT
+        assert awaiting.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_reset_interrupted_jobs_preserves_awaiting_title_selection(db_factory):
+    """AWAITING_TITLE_SELECTION jobs must survive a daemon restart unchanged,
+    since the user still needs to pick titles before the pipeline can resume."""
+    async with db_factory() as db:
+        ripping_job = Job(drive_path="/dev/sr0", disc_label="A", status=JobStatus.RIPPING)
+        awaiting_job = Job(
+            drive_path="/dev/sr1",
+            disc_label="B",
+            status=JobStatus.AWAITING_TITLE_SELECTION,
+            candidates="[]",
+        )
+        db.add_all([ripping_job, awaiting_job])
+        await db.commit()
+        await db.refresh(ripping_job)
+        await db.refresh(awaiting_job)
+        ripping_id = ripping_job.id
+        awaiting_id = awaiting_job.id
+
+    with patch("jacques.daemon.AsyncSessionLocal", db_factory):
+        count = await _reset_interrupted_jobs()
+
+    assert count == 1
+
+    async with db_factory() as db:
+        ripping = await db.get(Job, ripping_id)
+        awaiting = await db.get(Job, awaiting_id)
+        assert ripping.status == JobStatus.FAILED
+        assert ripping.error_message == "Interrupted by daemon restart"
+        assert awaiting.status == JobStatus.AWAITING_TITLE_SELECTION
+        assert awaiting.error_message is None
+
+
 # ── RippedDisc insertion tests ────────────────────────────────────────────────
 
 
