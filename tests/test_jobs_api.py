@@ -839,6 +839,62 @@ async def test_assign_episodes_400_unknown_title_id(api_client, db_factory):
 
 
 @pytest.mark.asyncio
+async def test_assign_episodes_400_duplicate_title_id(api_client, db_factory):
+    """Duplicate title_id in the submitted body (with another title missing) → 400."""
+    job_id = await _create_job(
+        db_factory,
+        status=JobStatus.AWAITING_EPISODE_ASSIGNMENT,
+        titles_json=_TWO_TITLES,
+        error_message=None,
+    )
+
+    response = await api_client.post(
+        f"/api/jobs/{job_id}/assign-episodes",
+        json=[
+            {"title_id": 0, "season": 1, "episode": 1, "name": "Pilot"},
+            {"title_id": 0, "season": 1, "episode": 2, "name": "Duplicate"},
+        ],
+    )
+
+    assert response.status_code == 400
+    assert "duplicate title_ids" in response.json()["detail"].lower()
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.AWAITING_EPISODE_ASSIGNMENT
+    assert job.episode_assignments is None
+
+
+@pytest.mark.asyncio
+async def test_assign_episodes_400_duplicate_title_id_with_matching_set(api_client, db_factory):
+    """Duplicate title_id where the deduped set of ids still equals parsed_title_ids
+    exactly (0, 0, 1 -> {0, 1}) must still be rejected, not silently accepted with a
+    dropped assignment.
+    """
+    job_id = await _create_job(
+        db_factory,
+        status=JobStatus.AWAITING_EPISODE_ASSIGNMENT,
+        titles_json=_TWO_TITLES,
+        error_message=None,
+    )
+
+    response = await api_client.post(
+        f"/api/jobs/{job_id}/assign-episodes",
+        json=[
+            {"title_id": 0, "season": 1, "episode": 1, "name": "Pilot"},
+            {"title_id": 0, "season": 1, "episode": 2, "name": "Duplicate"},
+            {"title_id": 1, "season": 1, "episode": 3, "name": "Second"},
+        ],
+    )
+
+    assert response.status_code == 400
+    assert "duplicate title_ids" in response.json()["detail"].lower()
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.AWAITING_EPISODE_ASSIGNMENT
+    assert job.episode_assignments is None
+
+
+@pytest.mark.asyncio
 async def test_assign_episodes_202_happy_path(api_client, db_factory, mock_queue):
     """Valid payload covering exactly the parsed_titles ids:
     - 202 response

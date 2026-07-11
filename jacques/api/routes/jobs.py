@@ -213,6 +213,9 @@ async def assign_episodes(
     parsed_title_ids = {t["id"] for t in job.parsed_titles}
     submitted_title_ids = {a.title_id for a in body}
 
+    if len(body) != len(submitted_title_ids):
+        raise HTTPException(status_code=400, detail="duplicate title_ids in request body")
+
     if submitted_title_ids != parsed_title_ids:
         missing = parsed_title_ids - submitted_title_ids
         extra = submitted_title_ids - parsed_title_ids
