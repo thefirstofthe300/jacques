@@ -1,0 +1,149 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
+import JobCard from './JobCard.svelte';
+import { rerunStage, deleteJob } from '../lib/api.js';
+
+vi.mock('../lib/api.js', () => ({
+  rerunStage: vi.fn(),
+  deleteJob: vi.fn(),
+}));
+
+// @testing-library/svelte auto-registers cleanup via global beforeEach/afterEach
+// hooks, but only when those hooks are true globals; this project doesn't set
+// `test.globals: true`, so register cleanup explicitly to avoid DOM leaking
+// between tests in this file.
+afterEach(cleanup);
+
+function makeJob(overrides = {}) {
+  return {
+    id: 1,
+    drive_path: '/dev/sr0',
+    disc_label: null,
+    disc_uuid: null,
+    disc_type: 'unknown',
+    status: 'detected',
+    title: null,
+    year: null,
+    progress: 0,
+    error_message: null,
+    display_name: 'Some Disc',
+    is_active: true,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    candidates: [],
+    titles: [],
+    episode_assignments: {},
+    selected_title_id: null,
+    ...overrides,
+  };
+}
+
+describe('JobCard', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+  });
+
+  it('renders a ripping job with progress bar and disc-type badge', () => {
+    const job = makeJob({
+      status: 'ripping',
+      disc_type: 'movie',
+      progress: 42,
+      display_name: 'The Matrix',
+      is_active: true,
+    });
+
+    const { container } = render(JobCard, { job });
+
+    expect(screen.getByText('The Matrix')).toBeTruthy();
+    expect(screen.getByText('/dev/sr0', { exact: false })).toBeTruthy();
+    expect(screen.getByText('ripping')).toBeTruthy();
+    expect(screen.getByText('Movie')).toBeTruthy();
+
+    const progressBar = container.querySelector('.progress-bar');
+    expect(progressBar).toBeTruthy();
+    expect(progressBar.style.width).toBe('42%');
+  });
+
+  it('shows disc_label alongside display_name when they differ', () => {
+    const job = makeJob({ display_name: 'The Matrix', disc_label: 'MATRIX_DISC' });
+
+    render(JobCard, { job });
+
+    expect(screen.getByText('MATRIX_DISC')).toBeTruthy();
+  });
+
+  it('renders a failed job with error message and retry buttons that call rerunStage', async () => {
+    const job = makeJob({
+      status: 'failed',
+      error_message: 'HandBrakeCLI exited with code 1',
+      is_active: false,
+    });
+
+    render(JobCard, { job });
+
+    expect(screen.getByText('failed')).toBeTruthy();
+    expect(screen.getByText('HandBrakeCLI exited with code 1')).toBeTruthy();
+
+    const rerunButton = screen.getByRole('button', { name: /Rip/ });
+    await fireEvent.click(rerunButton);
+
+    expect(rerunStage).toHaveBeenCalledWith(1, 'ripping');
+  });
+
+  it('renders a complete job without a progress bar but with retry buttons', () => {
+    const job = makeJob({ status: 'complete', is_active: false });
+
+    const { container } = render(JobCard, { job });
+
+    expect(screen.getByText('complete')).toBeTruthy();
+    expect(container.querySelector('.progress-bar')).toBeFalsy();
+    expect(screen.getByRole('button', { name: /Organize/ })).toBeTruthy();
+  });
+
+  it('shows a delete button for inactive jobs that calls deleteJob after confirmation', async () => {
+    const job = makeJob({ status: 'complete', is_active: false });
+
+    render(JobCard, { job });
+
+    const deleteButton = screen.getByRole('button', { name: /Delete/ });
+    await fireEvent.click(deleteButton);
+
+    expect(window.confirm).toHaveBeenCalled();
+    expect(deleteJob).toHaveBeenCalledWith(1);
+  });
+
+  it('does not render a delete button for active jobs', () => {
+    const job = makeJob({ status: 'ripping', is_active: true });
+
+    render(JobCard, { job });
+
+    expect(screen.queryByRole('button', { name: /Delete/ })).toBeNull();
+  });
+
+  it('renders a placeholder for duplicate_detected instead of pause-point forms', () => {
+    const job = makeJob({ status: 'duplicate_detected', is_active: true });
+
+    const { container } = render(JobCard, { job });
+
+    const placeholder = container.querySelector('.pause-point-placeholder');
+    expect(placeholder).toBeTruthy();
+    expect(placeholder.dataset.status).toBe('duplicate_detected');
+  });
+
+  it('renders a placeholder for awaiting_selection', () => {
+    const job = makeJob({ status: 'awaiting_selection', is_active: true });
+
+    const { container } = render(JobCard, { job });
+
+    expect(container.querySelector('.pause-point-placeholder')).toBeTruthy();
+  });
+
+  it('does not show the progress bar while status is detected', () => {
+    const job = makeJob({ status: 'detected', is_active: true });
+
+    const { container } = render(JobCard, { job });
+
+    expect(container.querySelector('.progress-bar')).toBeFalsy();
+  });
+});

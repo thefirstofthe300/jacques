@@ -11,6 +11,13 @@ export default defineConfig({
     outDir: '../jacques/static',
     emptyOutDir: true,
   },
+  // Svelte 5 ships separate client/server builds; without this, vitest
+  // resolves component imports to the server (SSR) build, which doesn't
+  // support mount()/lifecycle functions used by @testing-library/svelte.
+  // https://svelte.dev/docs/svelte/testing
+  resolve: {
+    conditions: ['browser'],
+  },
   test: {
     environment: 'jsdom',
   },
