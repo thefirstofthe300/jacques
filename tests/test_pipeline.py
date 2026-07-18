@@ -697,6 +697,30 @@ async def test_pipeline_pauses_on_close_metadata_matches(db_factory, tmp_path):
 # resolve while ripping is still in flight: nobody resolves it (falls through to
 # AWAITING_SELECTION once ripping finishes) or a concurrent /select-style DB
 # write resolves it before ripping finishes (pipeline proceeds without pausing).
+#
+# NOTE on synchronization: the tests below that need to observe a mid-rip status
+# transition (e.g. RIPPING_AWAITING_SELECTION) do so via a spy on daemon._update_job
+# rather than by polling the job row from a second, concurrently-opened DB session.
+# db_factory's in-memory SQLite engine uses a single shared connection (StaticPool),
+# and two truly concurrent AsyncSession objects issuing overlapping
+# BEGIN/UPDATE/COMMIT sequences on that one connection can interleave badly (one
+# session's ROLLBACK-on-close can land between another session's UPDATE and COMMIT
+# and silently discard it) — a limitation of the shared-connection test fixture,
+# not of daemon.py. Spying on the write call itself avoids opening any extra
+# concurrent session during the race window: we only read the job row once we know
+# (via the spy's event) that the write of interest has already committed and
+# nothing else is concurrently writing.
+
+
+def _status_write_spy(real_update_job, events: dict[JobStatus, asyncio.Event]):
+    """Wrap daemon._update_job so tests can await a specific status being
+    persisted, instead of polling the DB from a second concurrent session."""
+    async def _spy(job_id: int, **kwargs: object) -> None:
+        await real_update_job(job_id, **kwargs)
+        status = kwargs.get("status")
+        if status in events:
+            events[status].set()
+    return _spy
 
 
 @pytest.mark.asyncio
@@ -832,15 +856,19 @@ async def test_pipeline_ambiguous_match_discovered_mid_rip_then_pauses_at_awaiti
     mock_metadata = MagicMock()
     mock_metadata.identify = fake_identify
 
-    async def _wait_for_status(status: JobStatus) -> None:
-        while True:
-            job = await _get_job(db_factory, job_id)
-            if job is not None and job.status == status:
-                return
-            await asyncio.sleep(0.01)
+    ripping_written = asyncio.Event()
+    ripping_awaiting_selection_written = asyncio.Event()
+    spy_update_job = _status_write_spy(
+        daemon._update_job,
+        {
+            JobStatus.RIPPING: ripping_written,
+            JobStatus.RIPPING_AWAITING_SELECTION: ripping_awaiting_selection_written,
+        },
+    )
 
     with (
         patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon._update_job", spy_update_job),
         patch("jacques.daemon.Ripper", return_value=mock_ripper),
         patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
         patch("jacques.daemon.MetadataService", return_value=mock_metadata),
@@ -852,12 +880,12 @@ async def test_pipeline_ambiguous_match_discovered_mid_rip_then_pauses_at_awaiti
 
         # Ripping has started (status flipped to RIPPING); now let metadata
         # resolve while the rip loop is still blocked on rip_gate.
-        await asyncio.wait_for(_wait_for_status(JobStatus.RIPPING), timeout=2)
+        await asyncio.wait_for(ripping_written.wait(), timeout=2)
         identify_gate.set()
 
-        # Poll until the metadata task (running concurrently) has flagged the
+        # Wait until the metadata task (running concurrently) has flagged the
         # ambiguity, while the rip loop is still blocked on rip_gate.
-        await asyncio.wait_for(_wait_for_status(JobStatus.RIPPING_AWAITING_SELECTION), timeout=2)
+        await asyncio.wait_for(ripping_awaiting_selection_written.wait(), timeout=2)
 
         job = await _get_job(db_factory, job_id)
         assert job.status == JobStatus.RIPPING_AWAITING_SELECTION
@@ -932,15 +960,19 @@ async def test_pipeline_selection_resolved_mid_rip_proceeds_without_pausing(
     mock_metadata = MagicMock()
     mock_metadata.identify = fake_identify
 
-    async def _wait_for_status(status: JobStatus) -> None:
-        while True:
-            job = await _get_job(db_factory, job_id)
-            if job is not None and job.status == status:
-                return
-            await asyncio.sleep(0.01)
+    ripping_written = asyncio.Event()
+    ripping_awaiting_selection_written = asyncio.Event()
+    spy_update_job = _status_write_spy(
+        daemon._update_job,
+        {
+            JobStatus.RIPPING: ripping_written,
+            JobStatus.RIPPING_AWAITING_SELECTION: ripping_awaiting_selection_written,
+        },
+    )
 
     with (
         patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon._update_job", spy_update_job),
         patch("jacques.daemon.Ripper", return_value=mock_ripper),
         patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
         patch("jacques.daemon.MetadataService", return_value=mock_metadata),
@@ -950,10 +982,10 @@ async def test_pipeline_selection_resolved_mid_rip_proceeds_without_pausing(
             daemon._run_pipeline(job_id, "/dev/sr0", "THE_MATRIX")
         )
 
-        await asyncio.wait_for(_wait_for_status(JobStatus.RIPPING), timeout=2)
+        await asyncio.wait_for(ripping_written.wait(), timeout=2)
         identify_gate.set()
 
-        await asyncio.wait_for(_wait_for_status(JobStatus.RIPPING_AWAITING_SELECTION), timeout=2)
+        await asyncio.wait_for(ripping_awaiting_selection_written.wait(), timeout=2)
 
         # Simulate a concurrent /select call resolving the ambiguity while the
         # rip loop is still blocked — mirrors what the (separately implemented)
