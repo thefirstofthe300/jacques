@@ -143,7 +143,7 @@ async def select_match(
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    selectable = {JobStatus.AWAITING_SELECTION}
+    selectable = {JobStatus.AWAITING_SELECTION, JobStatus.RIPPING_AWAITING_SELECTION}
     if job.status not in selectable:
         raise HTTPException(status_code=409, detail="Job is not awaiting selection")
 
@@ -167,7 +167,8 @@ async def select_match(
         year = media_info.year
         disc_type = media_info.disc_type
 
-    was_paused = job.status == JobStatus.AWAITING_SELECTION
+    fully_paused = job.status == JobStatus.AWAITING_SELECTION
+    still_ripping = job.status == JobStatus.RIPPING_AWAITING_SELECTION
 
     job.title = title
     job.year = year
@@ -175,12 +176,14 @@ async def select_match(
     job.disc_type = disc_type
     job.candidates = None
     job.error_message = None
-    if was_paused:
+    if fully_paused:
         job.status = JobStatus.TRANSCODING
         job.progress = 0
+    elif still_ripping:
+        job.status = JobStatus.RIPPING
     await db.commit()
 
-    if was_paused:
+    if fully_paused:
         queue = getattr(request.app.state, "rerun_queue", None)
         if queue is None:
             raise HTTPException(status_code=503, detail="Service not ready")

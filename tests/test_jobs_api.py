@@ -556,6 +556,90 @@ async def test_select_match_tmdb_id_not_in_candidates_falls_through(api_client, 
     assert job.status == JobStatus.TRANSCODING
 
 
+# ── select_match — RIPPING_AWAITING_SELECTION status ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_select_match_ripping_awaiting_selection_sets_ripping(
+    api_client, db_factory, mock_queue
+):
+    """RIPPING_AWAITING_SELECTION job with a matching stored candidate:
+    - 202 response with job_id and tmdb_id
+    - DB: title/year/disc_type/tmdb_id set from the candidate, candidates=None
+    - DB: status becomes RIPPING (not TRANSCODING) and progress is left untouched
+    - rerun_queue is NOT touched (this path resumes ripping, not transcoding)
+    """
+    stored = '[{"tmdb_id": 550, "title": "Fight Club", "year": 1999, "disc_type": "movie", "overview": ""}]'
+    job_id = await _create_job(
+        db_factory,
+        status=JobStatus.RIPPING_AWAITING_SELECTION,
+        disc_type=DiscType.MOVIE,
+        candidates=stored,
+        error_message="paused mid-rip",
+        progress=40,
+    )
+
+    with patch("jacques.api.routes.jobs.MetadataService") as mock_cls:
+        response = await api_client.post(f"/api/jobs/{job_id}/select/550")
+
+        # Matching candidate found in stored JSON; no TMDb lookup needed
+        mock_cls.assert_not_called()
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_id"] == job_id
+    assert body["tmdb_id"] == 550
+
+    job = await _get_job(db_factory, job_id)
+    assert job.title == "Fight Club"
+    assert job.year == 1999
+    assert job.tmdb_id == 550
+    assert job.disc_type == DiscType.MOVIE
+    assert job.candidates is None
+    assert job.error_message is None
+    assert job.status == JobStatus.RIPPING
+    assert job.progress == 40
+
+    # rerun_queue must not be touched for the still-ripping path
+    assert mock_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_select_match_ripping_awaiting_selection_direct_tmdb_id(
+    api_client, db_factory, mock_queue
+):
+    """RIPPING_AWAITING_SELECTION job where the given tmdb_id is not among the
+    stored candidates: falls through to a direct TMDb lookup, still ends in
+    RIPPING (not TRANSCODING), and still never touches rerun_queue."""
+    stored = '[{"tmdb_id": 550, "title": "Fight Club", "year": 1999, "disc_type": "movie", "overview": ""}]'
+    job_id = await _create_job(
+        db_factory,
+        status=JobStatus.RIPPING_AWAITING_SELECTION,
+        disc_type=DiscType.MOVIE,
+        candidates=stored,
+        error_message=None,
+        progress=10,
+    )
+
+    fake_media = MediaInfo(title="The Patriot", year=2000, disc_type=DiscType.MOVIE, tmdb_id=9659)
+
+    with patch("jacques.api.routes.jobs.MetadataService") as mock_cls:
+        mock_cls.return_value.lookup_by_id = AsyncMock(return_value=fake_media)
+        response = await api_client.post(f"/api/jobs/{job_id}/select/9659")
+
+    assert response.status_code == 202
+    mock_cls.return_value.lookup_by_id.assert_awaited_once_with(9659, DiscType.MOVIE)
+
+    job = await _get_job(db_factory, job_id)
+    assert job.title == "The Patriot"
+    assert job.year == 2000
+    assert job.tmdb_id == 9659
+    assert job.candidates is None
+    assert job.status == JobStatus.RIPPING
+
+    assert mock_queue.empty()
+
+
 # ── DELETE /api/jobs/{job_id} ─────────────────────────────────────────────────
 
 
