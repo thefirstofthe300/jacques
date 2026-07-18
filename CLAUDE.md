@@ -86,6 +86,26 @@ frontend/               — Svelte + Vite SPA; npm run build outputs to ../jacqu
 
 ## Serena
 
-This project is Serena-onboarded (`.serena/` exists). Always use Serena's symbolic tools (`find_symbol`, `find_referencing_symbols`, `replace_symbol_body`, etc.) instead of plain-text Read/Grep/Edit when navigating or editing code here — call `initial_instructions` first if starting a fresh session.
+**Mandatory, not a suggestion.** This project is Serena-onboarded (`.serena/` exists). Call
+`initial_instructions` as the very first action of any session that touches code here — before
+any Read, Grep, or Edit — even if the task looks like a one-line fix. Loading it late, after
+you've already reached for plain-text tools out of habit, defeats the point.
+
+Once loaded, Serena's symbolic tools are required for code work in this repo, not one option
+among several:
+- **Discovery**: `get_symbols_overview`/`find_symbol` instead of Read. Grep/Glob are fine for
+  locating a file by name or a string by content, but once you've found it, the follow-up read
+  of that code must go through `find_symbol`, not Read.
+- **Edits**: `replace_symbol_body`/`insert_before_symbol`/`insert_after_symbol`/
+  `replace_content`/`rename_symbol`/`safe_delete_symbol` instead of Edit/Write on any `.py`,
+  `.js`, or `.svelte` file.
+- Plain Read/Edit on a code file is acceptable only when Serena genuinely can't help: the
+  target isn't code (docs, config values, `git log`/`git blame`), or the Serena MCP server is
+  disconnected entirely. "It's a short file," "I already know the path," and "one Read is
+  faster than a few Serena calls" are not valid reasons — those are exactly the cases Serena
+  handles cheaply too.
+- If you notice mid-task that you've been using Read/Grep/Edit on code files without having
+  called `initial_instructions` yet this session, stop and load it before continuing, rather
+  than finishing the task with the wrong tools and fixing it "next time."
 
 Consult Serena's project memories (`mem:core` as the entry point, which links to `mem:tech_stack`, `mem:conventions`, `mem:suggested_commands`, `mem:task_completion`) for architectural patterns, past design decisions, and established code style before assuming conventions from scratch. Cross-check anything memory-derived against current code — memories can lag behind recent commits.
