@@ -21,15 +21,21 @@ uv run jacques
 # Build/run via Nix (wraps in makemkvcon/HandBrakeCLI on PATH)
 nix build
 nix run
+
+# Frontend (Svelte + Vite SPA, in frontend/)
+cd frontend && npm install
+npm run dev      # Vite dev server
+npm run build    # production build, output baked into jacques/static/
+npm run test     # vitest
 ```
 
-No linter or formatter is configured. `doCheck = false` in `flake.nix` — the Nix package build does not run tests (some require the dev shell's `LD_LIBRARY_PATH` fix for greenlet/libstdc++); always validate with `uv run pytest` before committing.
+No linter or formatter is configured. `doCheck = false` in `flake.nix` — the Nix package build does not run tests (some require the dev shell's `LD_LIBRARY_PATH` fix for greenlet/libstdc++); always validate with `uv run pytest` before committing. `nix build`/`nix run` also build the frontend via `buildNpmPackage` and bake its output into the Python package's `static/` directory (see `flake.nix`'s `jacquesFrontend` derivation); `devShells.default` includes `pkgs.nodejs` for local frontend work.
 
 Subprocess calls (`makemkvcon`, `HandBrakeCLI`) and HTTP calls (TMDb) are always mocked in tests (`unittest.mock`/`AsyncMock`, `respx`) — no test depends on real hardware or network.
 
 ## Architecture
 
-Jacques is an async daemon (`jacques/daemon.py`) that watches optical drives via udev, rips discs with MakeMKV, transcodes to H.265 with HandBrakeCLI, identifies content via TMDb, and organizes output into Plex/Jellyfin directory layouts. A FastAPI + Jinja2 + HTMX web UI runs in the same process for job monitoring and pause-point resolution.
+Jacques is an async daemon (`jacques/daemon.py`) that watches optical drives via udev, rips discs with MakeMKV, transcodes to H.265 with HandBrakeCLI, identifies content via TMDb, and organizes output into Plex/Jellyfin directory layouts. A FastAPI process (same process as the daemon) serves the API and, for job monitoring and pause-point resolution, a client-side Svelte SPA (`frontend/`, built with Vite): the built assets are output to `jacques/static/` and served via a `StaticFiles(html=True)` mount at `/`, registered after the API routers so it doesn't shadow `/api/*`. The SPA fetches job state from the REST API (`/api/jobs/*`) and gets live updates by subscribing to `GET /api/jobs/stream`, an SSE endpoint backed by an in-process `Broadcaster` pub/sub (`jacques/services/broadcaster.py`) at `app.state.job_events`; every job-mutating code path — both `daemon.py`'s `_update_job` and the mutation routes in `routes/jobs.py` — publishes to it. There is no more Jinja2/HTMX polling or server-rendered partials.
 
 ### Job pipeline and pause points
 
@@ -61,19 +67,22 @@ jacques/
     transcoder.py       — HandBrakeCLI wrapper, progress parsed from --json stdout
     metadata.py         — TMDb client; MediaInfo or list[MediaInfo] when ambiguous
     organizer.py        — Plex/Jellyfin destination naming + move; _safe_name sanitizes filesystem-unsafe chars
+    broadcaster.py       — Broadcaster pub/sub (asyncio.Queue per subscriber) backing the SSE stream
   api/
-    app.py              — FastAPI app, dashboard route, Jinja2 templates, status→CSS-class filter
-    routes/jobs.py       — REST: list/get/delete, rerun, select, assign-episodes, keep-title, rerip
-    routes/partials.py   — HTMX partial renders for live job cards
-  templates/            — Jinja2 + HTMX, Bootstrap classes, full innerHTML replacement on refresh
+    app.py              — FastAPI app; mounts the built Svelte SPA from static/ via StaticFiles(html=True), registered after the API routers
+    routes/jobs.py       — REST: list/get/delete, candidates, rerun, select, assign-episodes, keep-title, rerip, plus GET /api/jobs/stream (SSE); JobResponse includes candidates/titles/episode_assignments
 tests/                  — pytest, one file per service/concern; in-memory sqlite via conftest.py db_factory fixture
+frontend/               — Svelte + Vite SPA; npm run build outputs to ../jacques/static (baked into the Nix package)
+  src/lib/               — api.js (REST client), sse.js (EventSource wrapper), store.js (job state store)
+  src/components/        — JobCard, CandidateSelector, TitleSelector, EpisodeAssignmentForm, DuplicateActions (Svelte components, one *.test.js per component via vitest)
 ```
 
 ### Conventions worth knowing
 
 - All I/O is async (`asyncio.subprocess`, SQLAlchemy async, httpx async); no sync blocking calls except `Organizer.move`, which explicitly runs `shutil.move` via `asyncio.to_thread`.
 - `Job.candidates`, `titles_json`, and `episode_assignments` are JSON-serialized text columns (SQLite has no native JSON in this schema) — always go through the `parsed_*` properties on `Job`, never `json.loads` the raw column elsewhere.
-- Web UI has no authentication by design — local network use only (also called out in the NixOS module's `openFirewall` option docs).
+- Web UI has no authentication by design — local network use only (also called out in the NixOS module's `openFirewall` option docs). Applies equally to the SPA.
+- Bootstrap 5 + Bootstrap Icons are bundled via npm (`frontend/package.json` dependencies) rather than CDN-loaded.
 
 ## Serena
 
