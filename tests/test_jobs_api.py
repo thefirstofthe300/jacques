@@ -309,6 +309,82 @@ async def test_rerun_202_organizing_with_transcoded_done(api_client, db_factory,
     assert enqueued == (job_id, JobStatus.ORGANIZING)
 
 
+# ── 202 — ripping with titles_json present ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerun_202_ripping(api_client, db_factory, mock_queue):
+    """FAILED job, stage=ripping, titles_json populated (already resolved during
+    a prior IDENTIFYING pass):
+    - 202 response with job_id and stage
+    - DB: status=RIPPING, error_message=None, progress=0
+    - Queue receives (job_id, JobStatus.RIPPING)
+    """
+    job_id = await _create_job(
+        db_factory,
+        status=JobStatus.FAILED,
+        titles_json=_TWO_TITLES,
+        progress=65,
+    )
+
+    response = await api_client.post(f"/api/jobs/{job_id}/rerun/ripping")
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["job_id"] == job_id
+    assert body["stage"] == "ripping"
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.RIPPING
+    assert job.error_message is None
+    assert job.progress == 0
+
+    assert not mock_queue.empty()
+    enqueued = mock_queue.get_nowait()
+    assert enqueued == (job_id, JobStatus.RIPPING)
+
+
+# ── 409 — ripping without titles_json ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rerun_409_ripping_no_titles_json(api_client, db_factory, mock_queue):
+    """stage=ripping without a titles_json (no disc titles were ever recorded,
+    e.g. the job crashed before finishing IDENTIFYING) → 409, and the rerun_queue
+    must not be touched."""
+    job_id = await _create_job(db_factory, status=JobStatus.FAILED, titles_json=None)
+
+    response = await api_client.post(f"/api/jobs/{job_id}/rerun/ripping")
+
+    assert response.status_code == 409
+    detail = response.json()["detail"].lower()
+    assert "identifying" in detail or "titles" in detail
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.FAILED
+
+    assert mock_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_rerun_409_active_job_takes_priority_over_ripping_titles_check(
+    api_client, db_factory, mock_queue
+):
+    """When a job is active (e.g. TRANSCODING) AND has no titles_json, stage=ripping
+    must still fail on the 'currently active' guard rather than the titles_json
+    precondition — the active-job check runs first."""
+    job_id = await _create_job(
+        db_factory, status=JobStatus.TRANSCODING, titles_json=None, error_message=None
+    )
+
+    response = await api_client.post(f"/api/jobs/{job_id}/rerun/ripping")
+
+    assert response.status_code == 409
+    assert "active" in response.json()["detail"].lower()
+
+    assert mock_queue.empty()
+
+
 # ── 503 — service not ready (no rerun_queue in app.state) ────────────────────
 
 

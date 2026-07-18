@@ -16,6 +16,7 @@ from ...services.metadata import MetadataService
 _RERUN_ENTRY_STAGES: dict[str, JobStatus] = {
     "identifying": JobStatus.IDENTIFYING,
     "fetching_metadata": JobStatus.FETCHING_METADATA,
+    "ripping": JobStatus.RIPPING,
     "transcoding": JobStatus.TRANSCODING,
     "organizing": JobStatus.ORGANIZING,
 }
@@ -100,6 +101,12 @@ async def rerun_job(
         raise HTTPException(
             status_code=409,
             detail="Job is currently active; wait for it to finish before rerunning",
+        )
+
+    if stage == "ripping" and not job.titles_json:
+        raise HTTPException(
+            status_code=409,
+            detail="No disc titles found for this job; rerun from identifying instead",
         )
 
     if stage == "transcoding":
