@@ -4,15 +4,25 @@
 
   let { job } = $props();
 
-  function handleRerip() {
-    if (window.confirm('Re-rip this disc? The previous rip will be kept.')) {
-      rerip(job.id);
+  let error = $state(null);
+
+  async function handleRerip() {
+    if (!window.confirm('Re-rip this disc? The previous rip will be kept.')) return;
+    error = null;
+    try {
+      await rerip(job.id);
+    } catch (err) {
+      error = err.message;
     }
   }
 
-  function handleDismiss() {
-    if (window.confirm('Dismiss this job? It will be removed.')) {
-      deleteJob(job.id);
+  async function handleDismiss() {
+    if (!window.confirm('Dismiss this job? It will be removed.')) return;
+    error = null;
+    try {
+      await deleteJob(job.id);
+    } catch (err) {
+      error = err.message;
     }
   }
 </script>
@@ -32,4 +42,10 @@
       <i class="bi bi-x-circle me-1"></i>Dismiss
     </button>
   </div>
+
+  {#if error}
+    <div class="mt-2 small text-danger">
+      <i class="bi bi-exclamation-triangle-fill me-1"></i>{error}
+    </div>
+  {/if}
 </div>

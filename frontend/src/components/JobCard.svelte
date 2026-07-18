@@ -39,13 +39,24 @@
   let showRetry = $derived(job.status === 'failed' || job.status === 'complete');
   let createdAt = $derived(new Date(job.created_at).toLocaleString());
 
-  function handleRerun(stage) {
-    rerunStage(job.id, stage);
+  let actionError = $state(null);
+
+  async function handleRerun(stage) {
+    actionError = null;
+    try {
+      await rerunStage(job.id, stage);
+    } catch (err) {
+      actionError = err.message;
+    }
   }
 
-  function handleDelete() {
-    if (window.confirm('Delete this job? This cannot be undone.')) {
-      deleteJob(job.id);
+  async function handleDelete() {
+    if (!window.confirm('Delete this job? This cannot be undone.')) return;
+    actionError = null;
+    try {
+      await deleteJob(job.id);
+    } catch (err) {
+      actionError = err.message;
     }
   }
 </script>
@@ -134,6 +145,12 @@
         <button type="button" class="btn btn-sm btn-outline-danger" onclick={handleDelete}>
           <i class="bi bi-trash me-1"></i>Delete
         </button>
+      </div>
+    {/if}
+
+    {#if actionError}
+      <div class="mt-2 small text-danger">
+        <i class="bi bi-exclamation-triangle-fill me-1"></i>{actionError}
       </div>
     {/if}
   </div>

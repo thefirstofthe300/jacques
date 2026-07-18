@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/svelte';
 import EpisodeAssignmentForm from './EpisodeAssignmentForm.svelte';
 import { assignEpisodes } from '../lib/api.js';
 
@@ -66,5 +66,20 @@ describe('EpisodeAssignmentForm', () => {
       { title_id: 10, season: 2, episode: 5, name: 'Pilot' },
       { title_id: 11, season: 1, episode: 2, name: '' },
     ]);
+  });
+
+  it('shows an error message when assignEpisodes rejects', async () => {
+    assignEpisodes.mockRejectedValue(
+      new Error('POST /1/assign-episodes failed (409): Job is not awaiting episode assignment'),
+    );
+    const job = makeJob();
+
+    render(EpisodeAssignmentForm, { job });
+
+    await fireEvent.click(screen.getByRole('button', { name: /Save & Continue/ }));
+
+    await waitFor(() =>
+      expect(screen.getByText(/Job is not awaiting episode assignment/)).toBeTruthy(),
+    );
   });
 });

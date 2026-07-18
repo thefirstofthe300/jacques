@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/svelte';
 import DuplicateActions from './DuplicateActions.svelte';
 import { rerip, deleteJob } from '../lib/api.js';
 
@@ -72,5 +72,27 @@ describe('DuplicateActions', () => {
 
     expect(window.confirm).toHaveBeenCalled();
     expect(deleteJob).toHaveBeenCalledWith(1);
+  });
+
+  it('shows an error message when rerip rejects', async () => {
+    rerip.mockRejectedValue(new Error('POST /1/rerip failed (404): Job not found'));
+    const job = makeJob();
+
+    render(DuplicateActions, { job });
+
+    await fireEvent.click(screen.getByRole('button', { name: /Re-rip/ }));
+
+    await waitFor(() => expect(screen.getByText(/Job not found/)).toBeTruthy());
+  });
+
+  it('shows an error message when deleteJob rejects', async () => {
+    deleteJob.mockRejectedValue(new Error('DELETE /1 failed (404): Job not found'));
+    const job = makeJob();
+
+    render(DuplicateActions, { job });
+
+    await fireEvent.click(screen.getByRole('button', { name: /Dismiss/ }));
+
+    await waitFor(() => expect(screen.getByText(/Job not found/)).toBeTruthy());
   });
 });

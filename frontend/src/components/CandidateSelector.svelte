@@ -14,6 +14,7 @@
   let searched = $state(false);
   let manualId = $state('');
   let manualType = $state(untrack(() => job.disc_type) === 'tv_show' ? 'tv_show' : 'movie');
+  let error = $state(null);
 
   async function search(discType) {
     loading = true;
@@ -26,13 +27,23 @@
     }
   }
 
-  function handleSelect(candidate) {
-    selectMatch(job.id, candidate.tmdb_id, candidate.disc_type);
+  async function handleSelect(candidate) {
+    error = null;
+    try {
+      await selectMatch(job.id, candidate.tmdb_id, candidate.disc_type);
+    } catch (err) {
+      error = err.message;
+    }
   }
 
-  function handleManualSubmit() {
+  async function handleManualSubmit() {
     if (!manualId) return;
-    selectMatch(job.id, manualId, manualType);
+    error = null;
+    try {
+      await selectMatch(job.id, manualId, manualType);
+    } catch (err) {
+      error = err.message;
+    }
   }
 </script>
 
@@ -118,4 +129,10 @@
       </button>
     </div>
   </div>
+
+  {#if error}
+    <div class="mt-2 small text-danger">
+      <i class="bi bi-exclamation-triangle-fill me-1"></i>{error}
+    </div>
+  {/if}
 </div>

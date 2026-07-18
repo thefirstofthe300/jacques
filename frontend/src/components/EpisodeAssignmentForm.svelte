@@ -2,6 +2,7 @@
   // Pause-point form for JobCard when job.status === 'awaiting_episode_assignment'.
   import { untrack } from 'svelte';
   import { assignEpisodes } from '../lib/api.js';
+  import { formatDuration } from '../lib/format.js';
 
   let { job } = $props();
 
@@ -17,16 +18,15 @@
     }))
   );
 
-  function formatDuration(seconds) {
-    const total = seconds ?? 0;
-    const h = Math.floor(total / 3600);
-    const m = Math.floor((total % 3600) / 60);
-    const s = Math.floor(total % 60);
-    return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-  }
+  let error = $state(null);
 
-  function handleSave() {
-    assignEpisodes(job.id, assignments);
+  async function handleSave() {
+    error = null;
+    try {
+      await assignEpisodes(job.id, assignments);
+    } catch (err) {
+      error = err.message;
+    }
   }
 </script>
 
@@ -76,4 +76,10 @@
       Save &amp; Continue
     </button>
   </div>
+
+  {#if error}
+    <div class="mt-2 small text-danger">
+      <i class="bi bi-exclamation-triangle-fill me-1"></i>{error}
+    </div>
+  {/if}
 </div>

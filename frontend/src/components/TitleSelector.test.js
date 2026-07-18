@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/svelte';
 import TitleSelector from './TitleSelector.svelte';
 import { keepTitle } from '../lib/api.js';
 
@@ -69,5 +69,19 @@ describe('TitleSelector', () => {
     render(TitleSelector, { job });
 
     expect(screen.queryByRole('button', { name: /Keep this one/ })).toBeNull();
+  });
+
+  it('shows an error message when keepTitle rejects', async () => {
+    keepTitle.mockRejectedValue(new Error('POST /1/keep-title/10 failed (409): Job is not awaiting title selection'));
+    const job = makeJob();
+
+    render(TitleSelector, { job });
+
+    const buttons = screen.getAllByRole('button', { name: /Keep this one/ });
+    await fireEvent.click(buttons[0]);
+
+    await waitFor(() =>
+      expect(screen.getByText(/Job is not awaiting title selection/)).toBeTruthy(),
+    );
   });
 });

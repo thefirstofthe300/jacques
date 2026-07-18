@@ -1,20 +1,19 @@
 <script>
   // Pause-point form for JobCard when job.status === 'awaiting_title_selection'.
   import { keepTitle } from '../lib/api.js';
+  import { formatDuration } from '../lib/format.js';
 
   let { job } = $props();
 
-  function formatDuration(seconds) {
-    const total = seconds ?? 0;
-    const h = Math.floor(total / 3600);
-    const m = Math.floor((total % 3600) / 60);
-    const s = Math.floor(total % 60);
-    return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-  }
+  let error = $state(null);
 
-  function handleKeep(title) {
-    if (window.confirm('Keep this title? The other candidate rips will be discarded.')) {
-      keepTitle(job.id, title.id);
+  async function handleKeep(title) {
+    if (!window.confirm('Keep this title? The other candidate rips will be discarded.')) return;
+    error = null;
+    try {
+      await keepTitle(job.id, title.id);
+    } catch (err) {
+      error = err.message;
     }
   }
 </script>
@@ -45,4 +44,10 @@
       </div>
     {/each}
   </div>
+
+  {#if error}
+    <div class="mt-2 small text-danger">
+      <i class="bi bi-exclamation-triangle-fill me-1"></i>{error}
+    </div>
+  {/if}
 </div>

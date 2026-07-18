@@ -114,4 +114,21 @@ describe('CandidateSelector', () => {
 
     expect(selectMatch).not.toHaveBeenCalled();
   });
+
+  it('shows an error message when selectMatch rejects', async () => {
+    getCandidates.mockResolvedValue([MOVIE_CANDIDATE]);
+    selectMatch.mockRejectedValue(new Error('POST /1/select/603 failed (409): Job is not awaiting selection'));
+    const job = makeJob();
+
+    render(CandidateSelector, { job });
+
+    await fireEvent.click(screen.getByRole('button', { name: /Movie/ }));
+    await waitFor(() => expect(screen.getByText('The Matrix')).toBeTruthy());
+
+    await fireEvent.click(screen.getByRole('button', { name: /^Select$/ }));
+
+    await waitFor(() =>
+      expect(screen.getByText(/Job is not awaiting selection/)).toBeTruthy(),
+    );
+  });
 });

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
+import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/svelte';
 import JobCard from './JobCard.svelte';
 import { rerunStage, deleteJob } from '../lib/api.js';
 
@@ -128,6 +128,31 @@ describe('JobCard', () => {
     render(JobCard, { job });
 
     expect(screen.queryByRole('button', { name: /Delete/ })).toBeNull();
+  });
+
+  it('shows an error message when rerunStage rejects', async () => {
+    rerunStage.mockRejectedValue(new Error('POST /1/rerun/ripping failed (409): Job is still active'));
+    const job = makeJob({ status: 'failed', is_active: false });
+
+    render(JobCard, { job });
+
+    const rerunButton = screen.getByRole('button', { name: /Rip/ });
+    await fireEvent.click(rerunButton);
+
+    await waitFor(() => expect(screen.getByText(/Job is still active/)).toBeTruthy());
+  });
+
+  it('shows an error message when deleteJob rejects', async () => {
+    deleteJob.mockRejectedValue(new Error('DELETE /1 failed (404): Job not found'));
+    const job = makeJob({ status: 'complete', is_active: false });
+
+    render(JobCard, { job });
+
+    const deleteButton = screen.getByRole('button', { name: /Delete/ });
+    await fireEvent.click(deleteButton);
+
+    expect(window.confirm).toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByText(/Job not found/)).toBeTruthy());
   });
 
   it('renders the DuplicateActions pause-point form for duplicate_detected', () => {
