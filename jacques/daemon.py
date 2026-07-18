@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import dataclasses
 import json
 import logging
@@ -80,6 +81,15 @@ async def _fetch_metadata(
         )
         return media_info
     return None
+
+
+def _media_info_from_job(job: Job) -> MediaInfo:
+    return MediaInfo(
+        title=job.title,
+        year=job.year,
+        disc_type=job.disc_type,
+        tmdb_id=job.tmdb_id,
+    )
 
 
 async def _find_resumable_paths(
@@ -177,6 +187,7 @@ async def _run_pipeline(
     resume_transcoded: list[Path] = []
     prior_job_id: int | None = None
     selected_title_id: int | None = None
+    metadata_task: asyncio.Task[MediaInfo | None] | None = None
 
     if not _should_run(JobStatus.IDENTIFYING, start_stage):
         async with AsyncSessionLocal() as db:
@@ -187,12 +198,7 @@ async def _run_pipeline(
                     all_titles = [TitleInfo(**t) for t in json.loads(job.titles_json)]
                     titles_to_rip = _titles_to_rip(ripper, disc_type_hint, all_titles)
                 if not _should_run(JobStatus.FETCHING_METADATA, start_stage) and job.title:
-                    media_info = MediaInfo(
-                        title=job.title,
-                        year=job.year,
-                        disc_type=job.disc_type,
-                        tmdb_id=job.tmdb_id,
-                    )
+                    media_info = _media_info_from_job(job)
 
     if not _should_run(JobStatus.RIPPING, start_stage):
         raw_paths = sorted(raw_dir.glob("*/*.mkv"), key=lambda p: int(p.parent.name)) if (raw_dir.exists() and (raw_dir / ".done").exists()) else []
@@ -222,7 +228,6 @@ async def _run_pipeline(
             titles_to_rip = _titles_to_rip(ripper, disc_type_hint, titles)
 
         # ── FETCHING METADATA (runs concurrently with ripping, see below) ───────
-        metadata_task: asyncio.Task[MediaInfo | None] | None = None
         if _should_run(JobStatus.FETCHING_METADATA, start_stage):
             metadata_task = asyncio.create_task(
                 _fetch_metadata(job_id, disc_label, disc_type_hint, metadata_svc),
@@ -235,7 +240,12 @@ async def _run_pipeline(
 
         # ── RIPPING (skipped if resuming from raw or transcoded output) ────────
         if _should_run(JobStatus.RIPPING, start_stage):
-            await _update_job(job_id, status=JobStatus.RIPPING, progress=0)
+            async with AsyncSessionLocal() as db:
+                job = await db.get(Job, job_id)
+                if job is not None and job.status != JobStatus.RIPPING_AWAITING_SELECTION:
+                    job.status = JobStatus.RIPPING
+                    job.progress = 0
+                    await db.commit()
             if resume_transcoded:
                 raw_paths = resume_raw  # may be empty; only needed for cleanup reference
             elif resume_raw:
@@ -269,21 +279,19 @@ async def _run_pipeline(
         # user might have already resolved it via /select while ripping was
         # still in progress) or TMDb had no match at all. Re-read from the DB
         # rather than trusting the metadata task's return value, since it can't
-        # know about a selection made concurrently while it was running.
-        if _should_run(JobStatus.RIPPING, start_stage) and media_info is None and metadata_task is not None:
+        # know about a selection made concurrently while it was running. The
+        # read-and-write happens in a single session/transaction so a concurrent
+        # /select call can't be clobbered by a stale decision made here.
+        if media_info is None and metadata_task is not None:
             async with AsyncSessionLocal() as db:
                 job = await db.get(Job, job_id)
-            if job is not None and job.candidates:
-                await _update_job(job_id, status=JobStatus.AWAITING_SELECTION)
-                log.info("Job %d: ripping complete, awaiting metadata selection before transcode", job_id)
-                return
-            if job is not None and job.title:
-                media_info = MediaInfo(
-                    title=job.title,
-                    year=job.year,
-                    disc_type=job.disc_type,
-                    tmdb_id=job.tmdb_id,
-                )
+                if job is not None and job.candidates:
+                    job.status = JobStatus.AWAITING_SELECTION
+                    await db.commit()
+                    log.info("Job %d: ripping complete, awaiting metadata selection before transcode", job_id)
+                    return
+                if job is not None and job.title:
+                    media_info = _media_info_from_job(job)
 
         # Pause before transcoding if a multi-title disc still needs per-title
         # episode assignment (TV) or a keep-this-one choice (movie). These read
@@ -394,6 +402,11 @@ async def _run_pipeline(
         log.info("Job %d complete", job_id)
 
     except Exception as exc:
+        if metadata_task is not None and not metadata_task.done():
+            metadata_task.cancel()
+        if metadata_task is not None:
+            with contextlib.suppress(BaseException):
+                await metadata_task
         log.exception("Job %d failed: %s", job_id, exc)
         await _update_job(job_id, status=JobStatus.FAILED, error_message=str(exc))
 
