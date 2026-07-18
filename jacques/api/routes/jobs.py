@@ -1,9 +1,10 @@
+import asyncio
 import json
 import logging
 import shutil
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -107,6 +108,41 @@ async def list_jobs(db: AsyncSession = Depends(get_db)) -> list[JobResponse]:
     result = await db.execute(select(Job).order_by(Job.created_at.desc()))
     jobs = result.scalars().all()
     return [JobResponse.from_job(j) for j in jobs]
+
+
+@router.get("/stream")
+async def stream_jobs(request: Request) -> StreamingResponse:
+    """Server-Sent Events stream of job mutations.
+
+    Emits `event: job-update` frames whose `data:` is the JSON-encoded event
+    dict published by `publish_job_event`/`publish_job_deleted` (shaped
+    `{"type": "job_upserted", "job": {...}}` or `{"type": "job_deleted", "job_id": ...}`).
+    Replaces HTMX polling of the job list/detail partials.
+    """
+    broadcaster = getattr(request.app.state, "job_events", None)
+    if broadcaster is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
+    queue = broadcaster.subscribe()
+
+    async def event_stream():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    continue
+                yield f"event: job-update\ndata: {json.dumps(event)}\n\n"
+        finally:
+            broadcaster.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @router.get("/{job_id}", response_model=JobResponse)
