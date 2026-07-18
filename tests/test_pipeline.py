@@ -689,6 +689,372 @@ async def test_pipeline_pauses_on_close_metadata_matches(db_factory, tmp_path):
     mock_transcoder.transcode.assert_not_called()
 
 
+# ── concurrent metadata fetch / ripping tests ───────────────────────────────────
+# Coverage for the daemon.py refactor that runs TMDb metadata fetching
+# (_fetch_metadata) as a background asyncio.Task created *before* the rip loop,
+# instead of awaiting it sequentially beforehand. These tests prove ripping is
+# not blocked on metadata resolution, and cover both ways the metadata pause can
+# resolve while ripping is still in flight: nobody resolves it (falls through to
+# AWAITING_SELECTION once ripping finishes) or a concurrent /select-style DB
+# write resolves it before ripping finishes (pipeline proceeds without pausing).
+
+
+@pytest.mark.asyncio
+async def test_pipeline_metadata_fetch_runs_concurrently_with_ripping(db_factory, tmp_path):
+    """Ripping must complete without waiting for metadata_svc.identify() to
+    resolve. identify() here is gated behind an asyncio.Event that the test only
+    sets *after* observing the rip loop finish. If the pipeline regressed to the
+    old sequential behavior (await identify() before ripping), the rip loop would
+    never even start until the gate is set — but the gate is never set until
+    after we've waited for the rip to finish, so a regression deadlocks. The
+    asyncio.wait_for timeout turns that potential deadlock into a clear failure
+    instead of a hung test."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    movie_title = TitleInfo(0, "Main Feature", 7200, "title_t00.mkv", 24)
+
+    metadata_gate = asyncio.Event()
+    rip_done = asyncio.Event()
+    order: list[str] = []
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        order.append("rip_start")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / "title_t00.mkv"
+        mkv.write_bytes(b"fake raw mkv")
+        await asyncio.sleep(0)  # yield to the event loop so metadata_task can run
+        order.append("rip_end")
+        rip_done.set()
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"fake h265 mkv")
+
+    async def fake_identify(disc_label, disc_type_hint):
+        order.append("metadata_start")
+        await metadata_gate.wait()
+        order.append("metadata_end")
+        return MediaInfo(title="The Matrix", year=1999, disc_type=DiscType.MOVIE, tmdb_id=603)
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=[movie_title])
+    mock_ripper.select_main_title = MagicMock(return_value=movie_title)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = fake_identify
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "THE_MATRIX")
+        pipeline_task = asyncio.create_task(
+            daemon._run_pipeline(job_id, "/dev/sr0", "THE_MATRIX")
+        )
+
+        # Ripping completes even though metadata is still gated — proves the rip
+        # loop did not wait on the metadata task.
+        await asyncio.wait_for(rip_done.wait(), timeout=2)
+        assert "metadata_start" in order
+        assert "metadata_end" not in order
+        assert order.index("rip_start") < order.index("rip_end")
+
+        metadata_gate.set()
+        await asyncio.wait_for(pipeline_task, timeout=5)
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    assert job.title == "The Matrix"
+    assert job.year == 1999
+    assert job.tmdb_id == 603
+
+
+@pytest.mark.asyncio
+async def test_pipeline_ambiguous_match_discovered_mid_rip_then_pauses_at_awaiting_selection(
+    db_factory, tmp_path
+):
+    """When metadata resolves ambiguously while ripping is still in progress, the
+    job's status should flip to RIPPING_AWAITING_SELECTION mid-rip (proving the
+    metadata task and the rip loop genuinely run concurrently rather than being
+    sequenced), and then — since nobody resolves the ambiguity before ripping
+    finishes — fall through to AWAITING_SELECTION once the rip completes, exactly
+    like the pre-existing sequential-metadata pause behavior."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    movie_title = TitleInfo(0, "Main Feature", 7200, "title_t00.mkv", 24)
+
+    rip_gate = asyncio.Event()
+    identify_gate = asyncio.Event()
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / "title_t00.mkv"
+        mkv.write_bytes(b"fake raw mkv")
+        await rip_gate.wait()
+        return mkv
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=[movie_title])
+    mock_ripper.select_main_title = MagicMock(return_value=movie_title)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = AsyncMock()
+
+    candidates = [
+        MediaInfo(title="The Matrix", year=1999, disc_type=DiscType.MOVIE, tmdb_id=603),
+        MediaInfo(title="The Matrix Reloaded", year=2003, disc_type=DiscType.MOVIE, tmdb_id=604),
+    ]
+
+    async def fake_identify(disc_label, disc_type_hint):
+        # Only resolve once ripping has already flipped status to RIPPING — the
+        # RIPPING block's own status write happens once, at the very start of
+        # the block, so if metadata resolved (and wrote
+        # RIPPING_AWAITING_SELECTION) *before* that write landed, it would be
+        # clobbered. Gating here reflects that ripping legitimately started
+        # first, then metadata caught up while it was still running.
+        await identify_gate.wait()
+        return candidates
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = fake_identify
+
+    async def _wait_for_status(status: JobStatus) -> None:
+        while True:
+            job = await _get_job(db_factory, job_id)
+            if job is not None and job.status == status:
+                return
+            await asyncio.sleep(0.01)
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "THE_MATRIX")
+        pipeline_task = asyncio.create_task(
+            daemon._run_pipeline(job_id, "/dev/sr0", "THE_MATRIX")
+        )
+
+        # Ripping has started (status flipped to RIPPING); now let metadata
+        # resolve while the rip loop is still blocked on rip_gate.
+        await asyncio.wait_for(_wait_for_status(JobStatus.RIPPING), timeout=2)
+        identify_gate.set()
+
+        # Poll until the metadata task (running concurrently) has flagged the
+        # ambiguity, while the rip loop is still blocked on rip_gate.
+        await asyncio.wait_for(_wait_for_status(JobStatus.RIPPING_AWAITING_SELECTION), timeout=2)
+
+        job = await _get_job(db_factory, job_id)
+        assert job.status == JobStatus.RIPPING_AWAITING_SELECTION
+        assert job.candidates is not None
+        mock_transcoder.transcode.assert_not_called()
+
+        # Let ripping finish now that we've observed the mid-rip status.
+        rip_gate.set()
+        await asyncio.wait_for(pipeline_task, timeout=5)
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.AWAITING_SELECTION
+    assert job.candidates is not None
+    parsed = json.loads(job.candidates)
+    assert len(parsed) == 2
+    mock_transcoder.transcode.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_selection_resolved_mid_rip_proceeds_without_pausing(
+    db_factory, tmp_path
+):
+    """If something resolves the metadata ambiguity (e.g. a concurrent /select
+    call) while the rip loop is still running, the pipeline must notice this on
+    its post-rip DB re-check and proceed straight through to transcode/organize
+    in the same async task — no pause, no requeue. This is the key regression
+    test for the "full concurrency" behavior: the pipeline must not blindly
+    trust metadata_task's own return value (None, since it saw an ambiguous
+    match) once someone else has resolved it in the DB."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    movie_title = TitleInfo(0, "Main Feature", 7200, "title_t00.mkv", 24)
+
+    rip_gate = asyncio.Event()
+    identify_gate = asyncio.Event()
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / "title_t00.mkv"
+        mkv.write_bytes(b"fake raw mkv")
+        await rip_gate.wait()
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"fake h265 mkv")
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=[movie_title])
+    mock_ripper.select_main_title = MagicMock(return_value=movie_title)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    candidates = [
+        MediaInfo(title="The Matrix", year=1999, disc_type=DiscType.MOVIE, tmdb_id=603),
+        MediaInfo(title="The Matrix Reloaded", year=2003, disc_type=DiscType.MOVIE, tmdb_id=604),
+    ]
+
+    async def fake_identify(disc_label, disc_type_hint):
+        # See the comment in the previous test: resolve only after ripping has
+        # already flipped status to RIPPING, so the metadata task's
+        # RIPPING_AWAITING_SELECTION write isn't clobbered by the RIPPING
+        # block's own (one-time, start-of-block) status write.
+        await identify_gate.wait()
+        return candidates
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = fake_identify
+
+    async def _wait_for_status(status: JobStatus) -> None:
+        while True:
+            job = await _get_job(db_factory, job_id)
+            if job is not None and job.status == status:
+                return
+            await asyncio.sleep(0.01)
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "THE_MATRIX")
+        pipeline_task = asyncio.create_task(
+            daemon._run_pipeline(job_id, "/dev/sr0", "THE_MATRIX")
+        )
+
+        await asyncio.wait_for(_wait_for_status(JobStatus.RIPPING), timeout=2)
+        identify_gate.set()
+
+        await asyncio.wait_for(_wait_for_status(JobStatus.RIPPING_AWAITING_SELECTION), timeout=2)
+
+        # Simulate a concurrent /select call resolving the ambiguity while the
+        # rip loop is still blocked — mirrors what the (separately implemented)
+        # select endpoint does to the DB.
+        async with db_factory() as db:
+            db_job = await db.get(Job, job_id)
+            db_job.title = "The Matrix"
+            db_job.year = 1999
+            db_job.tmdb_id = 603
+            db_job.disc_type = DiscType.MOVIE
+            db_job.candidates = None
+            db_job.status = JobStatus.RIPPING
+            await db.commit()
+
+        rip_gate.set()
+        await asyncio.wait_for(pipeline_task, timeout=5)
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    assert job.title == "The Matrix"
+    assert job.year == 1999
+    assert job.tmdb_id == 603
+
+    expected = tmp_path / "library" / "Movies" / "The Matrix (1999)" / "The Matrix (1999).mkv"
+    assert expected.exists()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_unambiguous_metadata_resolves_concurrently_with_rip_reaches_complete(
+    db_factory, tmp_path
+):
+    """Regression: an unambiguous TMDb match (single MediaInfo, no candidates)
+    must still flow through to COMPLETE with the right title/year/tmdb_id when
+    metadata resolves concurrently with ripping rather than beforehand."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+
+    movie_title = TitleInfo(0, "Main Feature", 7200, "title_t00.mkv", 24)
+
+    metadata_gate = asyncio.Event()
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / "title_t00.mkv"
+        mkv.write_bytes(b"fake raw mkv")
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"fake h265 mkv")
+
+    async def fake_identify(disc_label, disc_type_hint):
+        await metadata_gate.wait()
+        return MediaInfo(title="The Matrix", year=1999, disc_type=DiscType.MOVIE, tmdb_id=603)
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=[movie_title])
+    mock_ripper.select_main_title = MagicMock(return_value=movie_title)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = fake_identify
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "THE_MATRIX")
+        pipeline_task = asyncio.create_task(
+            daemon._run_pipeline(job_id, "/dev/sr0", "THE_MATRIX")
+        )
+
+        # Ripping should be able to finish (raw file written to disk) well before
+        # metadata resolves — give the loop a moment, then release the gate.
+        raw_file = tmp_path / "tmp" / str(job_id) / "raw" / "0" / "title_t00.mkv"
+        for _ in range(200):
+            if raw_file.exists():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("rip never wrote its output file")
+        assert not metadata_gate.is_set()
+
+        metadata_gate.set()
+        await asyncio.wait_for(pipeline_task, timeout=5)
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    assert job.title == "The Matrix"
+    assert job.year == 1999
+    assert job.tmdb_id == 603
+    assert job.progress == 100
+
+
 # ── episode assignment / title selection pause tests ───────────────────────────
 # Regression coverage for the pause block added right after the AWAITING_SELECTION
 # pause (daemon.py, gated on _should_run(JobStatus.TRANSCODING, start_stage) rather
