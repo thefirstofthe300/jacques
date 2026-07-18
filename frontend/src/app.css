@@ -1,3 +1,17 @@
 body {
   margin: 0;
 }
+
+/* Bootstrap's .btn-sm padding (0.25rem vertical + ~21px line-height) renders
+   at roughly 31px tall — fine for a mouse, tight for a fingertip. Bump the
+   tap target on coarse-pointer (touch) devices only, so the established
+   visual density of this dashboard is unchanged on desktop. */
+@media (pointer: coarse) {
+  .btn-sm {
+    min-height: 38px;
+    min-width: 38px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+}

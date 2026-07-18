@@ -53,11 +53,11 @@
 <div class="card job-card border mb-3">
   <div class="card-body py-3 px-4">
     <div class="d-flex justify-content-between align-items-start">
-      <div class="flex-grow-1 me-3">
-        <div class="fw-semibold mb-1">
+      <div class="flex-grow-1 me-3 job-info">
+        <div class="fw-semibold mb-1 text-break">
           {job.display_name}
         </div>
-        <div class="drive-path text-muted">
+        <div class="drive-path text-muted text-break">
           <i class="bi bi-hdd me-1"></i>{job.drive_path}
           {#if job.disc_label && job.disc_label !== job.display_name}
             <span class="ms-2 text-muted">&middot;</span>
@@ -138,3 +138,17 @@
     {/if}
   </div>
 </div>
+
+<style>
+  /* Flex items default to min-width: auto, which floors their width at their
+     content's intrinsic size and can force the whole header row to overflow
+     horizontally when display_name/drive_path is a long, space-free string
+     (e.g. a disc label like THE_LORD_OF_THE_RINGS_EXTENDED_DISC_1). Allowing
+     this column to shrink lets text-break actually wrap instead of pushing
+     the card wider than its container.
+     https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_flexible_box_layout/Overflow_and_flexbox
+   */
+  .job-info {
+    min-width: 0;
+  }
+</style>
