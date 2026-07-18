@@ -2119,6 +2119,40 @@ async def test_reset_interrupted_jobs_preserves_awaiting_title_selection(db_fact
         assert awaiting.error_message is None
 
 
+@pytest.mark.asyncio
+async def test_reset_interrupted_jobs_does_not_preserve_ripping_awaiting_selection(db_factory):
+    """RIPPING_AWAITING_SELECTION jobs must NOT survive a daemon restart: a real rip
+    subprocess was running in the background under that status, so it genuinely died
+    when the daemon restarted and the job should be marked failed, same as RIPPING."""
+    async with db_factory() as db:
+        ripping_job = Job(drive_path="/dev/sr0", disc_label="A", status=JobStatus.RIPPING)
+        ripping_awaiting_job = Job(
+            drive_path="/dev/sr1",
+            disc_label="B",
+            status=JobStatus.RIPPING_AWAITING_SELECTION,
+            candidates="[]",
+        )
+        db.add_all([ripping_job, ripping_awaiting_job])
+        await db.commit()
+        await db.refresh(ripping_job)
+        await db.refresh(ripping_awaiting_job)
+        ripping_id = ripping_job.id
+        ripping_awaiting_id = ripping_awaiting_job.id
+
+    with patch("jacques.daemon.AsyncSessionLocal", db_factory):
+        count = await _reset_interrupted_jobs()
+
+    assert count == 2
+
+    async with db_factory() as db:
+        ripping = await db.get(Job, ripping_id)
+        ripping_awaiting = await db.get(Job, ripping_awaiting_id)
+        assert ripping.status == JobStatus.FAILED
+        assert ripping.error_message == "Interrupted by daemon restart"
+        assert ripping_awaiting.status == JobStatus.FAILED
+        assert ripping_awaiting.error_message == "Interrupted by daemon restart"
+
+
 # ── RippedDisc insertion tests ────────────────────────────────────────────────
 
 
