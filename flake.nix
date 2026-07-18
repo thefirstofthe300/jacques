@@ -181,7 +181,6 @@
         runtimeDeps = [
           python.pkgs.fastapi
           python.pkgs.uvicorn
-          python.pkgs.jinja2
           python.pkgs."python-multipart"
           python.pkgs.sqlalchemy
           python.pkgs.aiosqlite
