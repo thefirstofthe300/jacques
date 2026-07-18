@@ -20,6 +20,7 @@ class JobStatus(str, enum.Enum):
     DUPLICATE_DETECTED = "duplicate_detected"
     AWAITING_EPISODE_ASSIGNMENT = "awaiting_episode_assignment"
     AWAITING_TITLE_SELECTION = "awaiting_title_selection"
+    RIPPING_AWAITING_SELECTION = "ripping_awaiting_selection"
 
 
 class DiscType(str, enum.Enum):
