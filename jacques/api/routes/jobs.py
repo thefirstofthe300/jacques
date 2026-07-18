@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ...config import settings
 from ...database import get_db
 from ...models.job import DiscType, Job, JobStatus
+from ...services.broadcaster import Broadcaster
 from ...services.metadata import MetadataService
 
 _RERUN_ENTRY_STAGES: dict[str, JobStatus] = {
@@ -99,12 +100,20 @@ async def stream_jobs(request: Request) -> StreamingResponse:
     dict published by `publish_job_event`/`publish_job_deleted` (shaped
     `{"type": "job_upserted", "job": {...}}` or `{"type": "job_deleted", "job_id": ...}`).
     Replaces HTMX polling of the job list/detail partials.
+
+    Returns 503 if the broadcaster isn't wired up yet, or if
+    `Broadcaster.max_subscribers` connections are already active (this is a
+    local-network, no-auth app, so the subscriber count is capped to bound
+    memory/file-descriptor usage rather than allowing unlimited connections).
     """
     broadcaster = getattr(request.app.state, "job_events", None)
     if broadcaster is None:
         raise HTTPException(status_code=503, detail="Service not ready")
 
-    queue = broadcaster.subscribe()
+    try:
+        queue = broadcaster.subscribe()
+    except Broadcaster.SubscriberLimitReached:
+        raise HTTPException(status_code=503, detail="Too many active connections; try again later")
 
     async def event_stream():
         try:

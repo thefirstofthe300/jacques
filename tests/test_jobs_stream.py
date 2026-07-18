@@ -193,3 +193,24 @@ async def test_stream_503_when_job_events_not_set():
         response = await client.get("/api/jobs/stream")
 
     assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_stream_503_when_subscriber_limit_reached():
+    """If the broadcaster is already at its subscriber cap, the endpoint
+    returns 503 instead of letting Broadcaster.SubscriberLimitReached
+    propagate as an unhandled 500."""
+    limited_broadcaster = Broadcaster(max_subscribers=1)
+    limited_broadcaster.subscribe()  # fill the only slot
+
+    app.state.job_events = limited_broadcaster
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.get("/api/jobs/stream")
+    finally:
+        del app.state.job_events
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Too many active connections; try again later"}
