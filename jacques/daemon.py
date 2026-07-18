@@ -11,6 +11,7 @@ from rich.logging import RichHandler
 from sqlalchemy import select
 
 from .api.app import app
+from .api.routes.jobs import JobResponse
 from .config import settings
 from .database import AsyncSessionLocal, init_db
 from .models.job import DiscType, Job, JobStatus
@@ -33,15 +34,13 @@ async def _update_job(job_id: int, **kwargs: object) -> None:
         for key, value in kwargs.items():
             setattr(job, key, value)
         await db.commit()
-        status = job.status
+        # Serialize inside the session block — accessing job attributes after
+        # the session closes risks a lazy-load-after-close error.
+        job_payload = JobResponse.from_job(job).model_dump(mode="json")
 
     broadcaster = getattr(app.state, "job_events", None)
     if broadcaster is not None:
-        broadcaster.publish({
-            "type": "job_upserted",
-            "job_id": job_id,
-            "status": status.value,
-        })
+        broadcaster.publish({"type": "job_upserted", "job": job_payload})
 
 
 def _stage_progress(job_id: int, stage_index: int, stage_count: int):

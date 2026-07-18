@@ -15,6 +15,7 @@ from httpx import ASGITransport, AsyncClient
 from jacques.api.app import app
 from jacques.database import get_db
 from jacques.models.job import DiscType, Job, JobStatus
+from jacques.services.broadcaster import Broadcaster
 from jacques.services.metadata import MediaInfo
 
 
@@ -69,10 +70,23 @@ async def mock_queue():
 
 
 @pytest_asyncio.fixture
-async def api_client(db_factory, mock_queue):
+async def broadcaster():
+    """A real Broadcaster we wire into app.state.job_events."""
+    return Broadcaster()
+
+
+@pytest_asyncio.fixture
+async def job_events_queue(broadcaster):
+    """A queue subscribed to `broadcaster`, so tests can inspect published events."""
+    return broadcaster.subscribe()
+
+
+@pytest_asyncio.fixture
+async def api_client(db_factory, mock_queue, broadcaster):
     """AsyncClient wired to the FastAPI app with:
     - get_db overridden to use the in-memory db_factory
     - app.state.rerun_queue set to mock_queue
+    - app.state.job_events set to broadcaster
     """
     async def _override_get_db():
         async with db_factory() as session:
@@ -80,6 +94,7 @@ async def api_client(db_factory, mock_queue):
 
     app.dependency_overrides[get_db] = _override_get_db
     app.state.rerun_queue = mock_queue
+    app.state.job_events = broadcaster
 
     async with AsyncClient(
         transport=ASGITransport(app=app), base_url="http://test"
@@ -89,6 +104,56 @@ async def api_client(db_factory, mock_queue):
     app.dependency_overrides.clear()
     if hasattr(app.state, "rerun_queue"):
         del app.state.rerun_queue
+    if hasattr(app.state, "job_events"):
+        del app.state.job_events
+
+
+# ── GET /api/jobs/{job_id} — JobResponse serialization ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_get_job_serializes_candidates_titles_and_assignments(api_client, db_factory):
+    """JobResponse must expose candidates, titles, episode_assignments, and
+    selected_title_id (parsed from their JSON-string columns) in the API response."""
+    stored_candidates = '[{"tmdb_id": 550, "title": "Fight Club", "year": 1999, "disc_type": "movie", "overview": ""}]'
+    stored_titles = _TWO_TITLES
+    stored_assignments = json.dumps({"0": {"season": 1, "episode": 1, "name": "Pilot"}})
+
+    job_id = await _create_job(
+        db_factory,
+        status=JobStatus.AWAITING_SELECTION,
+        candidates=stored_candidates,
+        titles_json=stored_titles,
+        episode_assignments=stored_assignments,
+        selected_title_id=1,
+    )
+
+    response = await api_client.get(f"/api/jobs/{job_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["candidates"] == [
+        {"tmdb_id": 550, "title": "Fight Club", "year": 1999, "disc_type": "movie", "overview": ""}
+    ]
+    assert body["titles"] == [_title(0, "Episode A"), _title(1, "Episode B")]
+    assert body["episode_assignments"] == {"0": {"season": 1, "episode": 1, "name": "Pilot"}}
+    assert body["selected_title_id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_get_job_serializes_empty_defaults(api_client, db_factory):
+    """A job with none of the JSON columns set serializes to empty defaults,
+    not null, for the new list/dict fields."""
+    job_id = await _create_job(db_factory, status=JobStatus.FAILED)
+
+    response = await api_client.get(f"/api/jobs/{job_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["candidates"] == []
+    assert body["titles"] == []
+    assert body["episode_assignments"] == {}
+    assert body["selected_title_id"] is None
 
 
 # ── 404 — job not found ───────────────────────────────────────────────────────
@@ -178,11 +243,12 @@ async def test_rerun_409_organizing_no_transcoded_done(api_client, db_factory, t
 
 
 @pytest.mark.asyncio
-async def test_rerun_202_fetching_metadata(api_client, db_factory, mock_queue):
+async def test_rerun_202_fetching_metadata(api_client, db_factory, mock_queue, job_events_queue):
     """FAILED job reruns from fetching_metadata:
     - 202 response with job_id and stage
     - DB: status=FETCHING_METADATA, error_message=None, progress=0
     - Queue receives (job_id, JobStatus.FETCHING_METADATA)
+    - A job_upserted event is published with the updated status
     """
     job_id = await _create_job(db_factory, status=JobStatus.FAILED, progress=42)
 
@@ -201,6 +267,12 @@ async def test_rerun_202_fetching_metadata(api_client, db_factory, mock_queue):
     assert not mock_queue.empty()
     enqueued = mock_queue.get_nowait()
     assert enqueued == (job_id, JobStatus.FETCHING_METADATA)
+
+    assert not job_events_queue.empty()
+    event = job_events_queue.get_nowait()
+    assert event["type"] == "job_upserted"
+    assert event["job"]["id"] == job_id
+    assert event["job"]["status"] == "fetching_metadata"
 
 
 @pytest.mark.asyncio
@@ -431,12 +503,13 @@ async def test_rerun_enqueues_exactly_one_item(api_client, db_factory, mock_queu
 
 
 @pytest.mark.asyncio
-async def test_select_match_direct_tmdb_id(api_client, db_factory, mock_queue):
+async def test_select_match_direct_tmdb_id(api_client, db_factory, mock_queue, job_events_queue):
     """AWAITING_SELECTION job with candidates=None:
     - MetadataService.lookup_by_id is called with the given tmdb_id and disc_type
     - 202 response with job_id and tmdb_id
     - DB: title/year/disc_type updated, candidates=None, status=TRANSCODING, progress=0
     - Queue receives (job_id, JobStatus.TRANSCODING)
+    - A job_upserted event is published with the resolved title
     """
     job_id = await _create_job(
         db_factory,
@@ -480,6 +553,13 @@ async def test_select_match_direct_tmdb_id(api_client, db_factory, mock_queue):
     assert not mock_queue.empty()
     enqueued = mock_queue.get_nowait()
     assert enqueued == (job_id, JobStatus.TRANSCODING)
+
+    assert not job_events_queue.empty()
+    event = job_events_queue.get_nowait()
+    assert event["type"] == "job_upserted"
+    assert event["job"]["id"] == job_id
+    assert event["job"]["title"] == "Inception"
+    assert event["job"]["status"] == "transcoding"
 
 
 @pytest.mark.asyncio
@@ -720,14 +800,19 @@ async def test_select_match_ripping_awaiting_selection_direct_tmdb_id(
 
 
 @pytest.mark.asyncio
-async def test_delete_204_complete_job(api_client, db_factory):
-    """DELETE on a COMPLETE job returns 204 and removes the row from the DB."""
+async def test_delete_204_complete_job(api_client, db_factory, job_events_queue):
+    """DELETE on a COMPLETE job returns 204, removes the row from the DB, and
+    publishes a job_deleted event carrying just the job_id."""
     job_id = await _create_job(db_factory, status=JobStatus.COMPLETE, error_message=None, progress=100)
 
     response = await api_client.delete(f"/api/jobs/{job_id}")
 
     assert response.status_code == 204
     assert await _get_job(db_factory, job_id) is None
+
+    assert not job_events_queue.empty()
+    event = job_events_queue.get_nowait()
+    assert event == {"type": "job_deleted", "job_id": job_id}
 
 
 @pytest.mark.asyncio
@@ -793,11 +878,12 @@ async def test_delete_404_job_not_found(api_client):
 
 
 @pytest.mark.asyncio
-async def test_rerip_202_duplicate_detected(api_client, db_factory, mock_queue):
+async def test_rerip_202_duplicate_detected(api_client, db_factory, mock_queue, job_events_queue):
     """rerip on a DUPLICATE_DETECTED job:
     - 202 response with job_id
     - DB: status=IDENTIFYING, progress=0, error_message=None
     - Queue receives (job_id, JobStatus.IDENTIFYING)
+    - A job_upserted event is published with the reset status
     """
     job_id = await _create_job(
         db_factory,
@@ -819,6 +905,12 @@ async def test_rerip_202_duplicate_detected(api_client, db_factory, mock_queue):
     assert not mock_queue.empty()
     enqueued = mock_queue.get_nowait()
     assert enqueued == (job_id, JobStatus.IDENTIFYING)
+
+    assert not job_events_queue.empty()
+    event = job_events_queue.get_nowait()
+    assert event["type"] == "job_upserted"
+    assert event["job"]["id"] == job_id
+    assert event["job"]["status"] == "identifying"
 
 
 @pytest.mark.asyncio
@@ -1055,12 +1147,13 @@ async def test_assign_episodes_400_duplicate_title_id_with_matching_set(api_clie
 
 
 @pytest.mark.asyncio
-async def test_assign_episodes_202_happy_path(api_client, db_factory, mock_queue):
+async def test_assign_episodes_202_happy_path(api_client, db_factory, mock_queue, job_events_queue):
     """Valid payload covering exactly the parsed_titles ids:
     - 202 response
     - DB: episode_assignments stored as {"<title_id>": {season, episode, name}},
       status=TRANSCODING, progress=0, error_message=None
     - Queue receives (job_id, JobStatus.TRANSCODING)
+    - A job_upserted event is published with the stored episode_assignments
     """
     job_id = await _create_job(
         db_factory,
@@ -1096,6 +1189,15 @@ async def test_assign_episodes_202_happy_path(api_client, db_factory, mock_queue
     assert not mock_queue.empty()
     enqueued = mock_queue.get_nowait()
     assert enqueued == (job_id, JobStatus.TRANSCODING)
+
+    assert not job_events_queue.empty()
+    event = job_events_queue.get_nowait()
+    assert event["type"] == "job_upserted"
+    assert event["job"]["id"] == job_id
+    assert event["job"]["episode_assignments"] == {
+        "0": {"season": 1, "episode": 1, "name": "Pilot"},
+        "1": {"season": 1, "episode": 2, "name": "Second"},
+    }
 
 
 # ── POST /api/jobs/{job_id}/keep-title/{title_id} ─────────────────────────────
@@ -1158,11 +1260,12 @@ async def test_keep_title_400_unknown_title_id(api_client, db_factory):
 
 
 @pytest.mark.asyncio
-async def test_keep_title_202_happy_path(api_client, db_factory, mock_queue):
+async def test_keep_title_202_happy_path(api_client, db_factory, mock_queue, job_events_queue):
     """Valid title_id among parsed_titles:
     - 202 response
     - DB: selected_title_id set, status=TRANSCODING, progress=0, error_message=None
     - Queue receives (job_id, JobStatus.TRANSCODING)
+    - A job_upserted event is published with the selected_title_id
     """
     job_id = await _create_job(
         db_factory,
@@ -1188,6 +1291,12 @@ async def test_keep_title_202_happy_path(api_client, db_factory, mock_queue):
     assert not mock_queue.empty()
     enqueued = mock_queue.get_nowait()
     assert enqueued == (job_id, JobStatus.TRANSCODING)
+
+    assert not job_events_queue.empty()
+    event = job_events_queue.get_nowait()
+    assert event["type"] == "job_upserted"
+    assert event["job"]["id"] == job_id
+    assert event["job"]["selected_title_id"] == 1
 
 
 @pytest.mark.asyncio

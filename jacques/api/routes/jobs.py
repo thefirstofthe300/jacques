@@ -41,6 +41,10 @@ class JobResponse(BaseModel):
     is_active: bool
     created_at: str
     updated_at: str
+    candidates: list[dict]
+    titles: list[dict]
+    episode_assignments: dict
+    selected_title_id: int | None
 
     model_config = {"from_attributes": True}
 
@@ -61,7 +65,33 @@ class JobResponse(BaseModel):
             is_active=job.is_active,
             created_at=job.created_at.isoformat(),
             updated_at=job.updated_at.isoformat(),
+            candidates=job.parsed_candidates,
+            titles=job.parsed_titles,
+            episode_assignments=job.parsed_episode_assignments,
+            selected_title_id=job.selected_title_id,
         )
+
+
+def publish_job_event(broadcaster, job: Job, event_type: str = "job_upserted") -> None:
+    """Publish a job-upserted event carrying the full job payload, if a
+    broadcaster is wired up. No-ops if `broadcaster` is None (not yet set on
+    `app.state`, e.g. in tests that don't need it).
+    """
+    if broadcaster is None:
+        return
+    broadcaster.publish({"type": event_type, "job": JobResponse.from_job(job).model_dump(mode="json")})
+
+
+def publish_job_deleted(broadcaster, job_id: int) -> None:
+    """Publish a job-deleted event carrying just the job's id.
+
+    Callers must capture `job_id` before deleting the row — once the ORM
+    object is deleted and the session committed, its attributes are no
+    longer safe to access.
+    """
+    if broadcaster is None:
+        return
+    broadcaster.publish({"type": "job_deleted", "job_id": job_id})
 
 
 @router.get("", response_model=list[JobResponse])
@@ -129,6 +159,7 @@ async def rerun_job(
     job.error_message = None
     job.progress = 0
     await db.commit()
+    publish_job_event(getattr(request.app.state, "job_events", None), job)
 
     queue = getattr(request.app.state, "rerun_queue", None)
     if queue is None:
@@ -189,6 +220,7 @@ async def select_match(
     elif still_ripping:
         job.status = JobStatus.RIPPING
     await db.commit()
+    publish_job_event(getattr(request.app.state, "job_events", None), job)
 
     if fully_paused:
         queue = getattr(request.app.state, "rerun_queue", None)
@@ -244,6 +276,7 @@ async def assign_episodes(
     job.progress = 0
     job.error_message = None
     await db.commit()
+    publish_job_event(getattr(request.app.state, "job_events", None), job)
 
     queue = getattr(request.app.state, "rerun_queue", None)
     if queue is None:
@@ -286,6 +319,7 @@ async def keep_title(
             log.warning("Job %d: failed to clean up discarded title %s raw output: %s", job_id, other_id, exc)
 
     await db.commit()
+    publish_job_event(getattr(request.app.state, "job_events", None), job)
 
     queue = getattr(request.app.state, "rerun_queue", None)
     if queue is None:
@@ -298,6 +332,7 @@ async def keep_title(
 @router.delete("/{job_id}", status_code=204)
 async def delete_job(
     job_id: int,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> None:
     job = await db.get(Job, job_id)
@@ -307,8 +342,10 @@ async def delete_job(
     if job.is_active:
         raise HTTPException(status_code=409, detail="Cannot delete an active job")
 
+    deleted_job_id = job.id
     await db.delete(job)
     await db.commit()
+    publish_job_deleted(getattr(request.app.state, "job_events", None), deleted_job_id)
 
 
 @router.post("/{job_id}/rerip", status_code=202)
@@ -332,6 +369,7 @@ async def rerip_job(
     job.progress = 0
     job.error_message = None
     await db.commit()
+    publish_job_event(getattr(request.app.state, "job_events", None), job)
 
     await queue.put((job_id, JobStatus.IDENTIFYING))
 
