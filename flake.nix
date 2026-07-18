@@ -234,6 +234,22 @@
           jacques = jacquesApp;
         };
 
+        # `uv run pytest` needs libstdc++ for greenlet's compiled extension
+        # (SQLAlchemy's async engine dependency). Nix-built Python binaries
+        # never search system library paths — only RPATH/LD_LIBRARY_PATH — so
+        # this fails whenever pytest runs outside an actual `nix develop`
+        # session (the devShell's shellHook below sets it, but that only
+        # covers interactive/`-c` shell entry). This app wraps the same fix so
+        # tests can be run reliably from anywhere, e.g. CI or a script, via
+        # `nix run .#test -- tests/test_pipeline.py -v`.
+        apps.test = {
+          type = "app";
+          program = toString (pkgs.writeShellScript "jacques-run-tests" ''
+            export LD_LIBRARY_PATH="${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH"
+            exec ${pkgs.uv}/bin/uv run pytest "$@"
+          '');
+        };
+
         devShells.default = pkgs.mkShell {
           packages = [
             pkgs.uv
