@@ -11,7 +11,6 @@ from rich.logging import RichHandler
 from sqlalchemy import select
 
 from .api.app import app
-from .api.routes.jobs import JobResponse
 from .config import settings
 from .database import AsyncSessionLocal, init_db
 from .models.job import DiscType, Job, JobStatus
@@ -36,7 +35,7 @@ async def _update_job(job_id: int, **kwargs: object) -> None:
         await db.commit()
         # Serialize inside the session block — accessing job attributes after
         # the session closes risks a lazy-load-after-close error.
-        job_payload = JobResponse.from_job(job).model_dump(mode="json")
+        job_payload = job.to_response_dict()
 
     broadcaster = getattr(app.state, "job_events", None)
     if broadcaster is not None:

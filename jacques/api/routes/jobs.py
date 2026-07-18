@@ -51,26 +51,7 @@ class JobResponse(BaseModel):
 
     @classmethod
     def from_job(cls, job: Job) -> "JobResponse":
-        return cls(
-            id=job.id,
-            drive_path=job.drive_path,
-            disc_label=job.disc_label,
-            disc_uuid=job.disc_uuid,
-            disc_type=job.disc_type.value,
-            status=job.status.value,
-            title=job.title,
-            year=job.year,
-            progress=job.progress,
-            error_message=job.error_message,
-            display_name=job.display_name,
-            is_active=job.is_active,
-            created_at=job.created_at.isoformat(),
-            updated_at=job.updated_at.isoformat(),
-            candidates=job.parsed_candidates,
-            titles=job.parsed_titles,
-            episode_assignments=job.parsed_episode_assignments,
-            selected_title_id=job.selected_title_id,
-        )
+        return cls(**job.to_response_dict())
 
 
 class CandidateResponse(BaseModel):
