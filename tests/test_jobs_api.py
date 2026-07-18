@@ -524,12 +524,18 @@ async def test_rerun_409_active_job_takes_priority_over_ripping_titles_check(
 @pytest.mark.asyncio
 async def test_rerun_503_service_not_ready(db_factory):
     """If rerun_queue is absent from app.state, the endpoint returns 503 rather
-    than raising an AttributeError."""
+    than raising an AttributeError, and — since the queue check now runs before
+    any job mutation/commit/publish — the job's DB row is left completely
+    unchanged and no event is published."""
     async def _override_get_db():
         async with db_factory() as session:
             yield session
 
+    broadcaster = Broadcaster()
+    events_queue = broadcaster.subscribe()
+
     app.dependency_overrides[get_db] = _override_get_db
+    app.state.job_events = broadcaster
     if hasattr(app.state, "rerun_queue"):
         del app.state.rerun_queue
 
@@ -537,14 +543,25 @@ async def test_rerun_503_service_not_ready(db_factory):
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
-            job_id = await _create_job(db_factory, status=JobStatus.FAILED)
+            job_id = await _create_job(
+                db_factory, status=JobStatus.FAILED, progress=42, error_message="boom"
+            )
             response = await client.post(f"/api/jobs/{job_id}/rerun/identifying")
         assert response.status_code == 503
         assert "not ready" in response.json()["detail"].lower()
+
+        job = await _get_job(db_factory, job_id)
+        assert job.status == JobStatus.FAILED
+        assert job.progress == 42
+        assert job.error_message == "boom"
+
+        assert events_queue.empty()
     finally:
         app.dependency_overrides.clear()
         if hasattr(app.state, "rerun_queue"):
             del app.state.rerun_queue
+        if hasattr(app.state, "job_events"):
+            del app.state.job_events
 
 
 # ── queue isolation — only one item enqueued per request ─────────────────────
@@ -702,12 +719,18 @@ async def test_select_match_409_ripping_status(api_client, db_factory):
 @pytest.mark.asyncio
 async def test_select_match_503_no_rerun_queue(db_factory):
     """If rerun_queue is absent from app.state, the select endpoint returns 503
-    rather than raising an AttributeError."""
+    rather than raising an AttributeError, and — since the queue check now runs
+    before any job mutation/commit/publish on the fully_paused path — the job's
+    DB row is left completely unchanged and no event is published."""
     async def _override_get_db():
         async with db_factory() as session:
             yield session
 
+    broadcaster = Broadcaster()
+    events_queue = broadcaster.subscribe()
+
     app.dependency_overrides[get_db] = _override_get_db
+    app.state.job_events = broadcaster
     if hasattr(app.state, "rerun_queue"):
         del app.state.rerun_queue
 
@@ -721,6 +744,7 @@ async def test_select_match_503_no_rerun_queue(db_factory):
                 disc_type=DiscType.MOVIE,
                 candidates='[{"tmdb_id": 550, "title": "Fight Club", "year": 1999, "disc_type": "movie", "overview": ""}]',
                 error_message=None,
+                progress=25,
             )
 
             fake_media = MediaInfo(
@@ -736,10 +760,19 @@ async def test_select_match_503_no_rerun_queue(db_factory):
 
         assert response.status_code == 503
         assert "not ready" in response.json()["detail"].lower()
+
+        job = await _get_job(db_factory, job_id)
+        assert job.status == JobStatus.AWAITING_SELECTION
+        assert job.title is None
+        assert job.progress == 25
+
+        assert events_queue.empty()
     finally:
         app.dependency_overrides.clear()
         if hasattr(app.state, "rerun_queue"):
             del app.state.rerun_queue
+        if hasattr(app.state, "job_events"):
+            del app.state.job_events
 
 
 @pytest.mark.asyncio
@@ -1208,6 +1241,61 @@ async def test_assign_episodes_400_duplicate_title_id_with_matching_set(api_clie
 
 
 @pytest.mark.asyncio
+async def test_assign_episodes_503_no_rerun_queue(db_factory):
+    """If rerun_queue is absent from app.state, assign-episodes returns 503
+    rather than raising an AttributeError, and — since the queue check now
+    runs before any job mutation/commit/publish — the job's DB row is left
+    completely unchanged and no event is published."""
+    async def _override_get_db():
+        async with db_factory() as session:
+            yield session
+
+    broadcaster = Broadcaster()
+    events_queue = broadcaster.subscribe()
+
+    app.dependency_overrides[get_db] = _override_get_db
+    app.state.job_events = broadcaster
+    if hasattr(app.state, "rerun_queue"):
+        del app.state.rerun_queue
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            job_id = await _create_job(
+                db_factory,
+                status=JobStatus.AWAITING_EPISODE_ASSIGNMENT,
+                titles_json=_TWO_TITLES,
+                error_message="stale error",
+                progress=10,
+            )
+
+            payload = [
+                {"title_id": 0, "season": 1, "episode": 1, "name": "Pilot"},
+                {"title_id": 1, "season": 1, "episode": 2, "name": "Second"},
+            ]
+
+            response = await client.post(f"/api/jobs/{job_id}/assign-episodes", json=payload)
+
+        assert response.status_code == 503
+        assert "not ready" in response.json()["detail"].lower()
+
+        job = await _get_job(db_factory, job_id)
+        assert job.status == JobStatus.AWAITING_EPISODE_ASSIGNMENT
+        assert job.episode_assignments is None
+        assert job.progress == 10
+        assert job.error_message == "stale error"
+
+        assert events_queue.empty()
+    finally:
+        app.dependency_overrides.clear()
+        if hasattr(app.state, "rerun_queue"):
+            del app.state.rerun_queue
+        if hasattr(app.state, "job_events"):
+            del app.state.job_events
+
+
+@pytest.mark.asyncio
 async def test_assign_episodes_202_happy_path(api_client, db_factory, mock_queue, job_events_queue):
     """Valid payload covering exactly the parsed_titles ids:
     - 202 response
@@ -1318,6 +1406,69 @@ async def test_keep_title_400_unknown_title_id(api_client, db_factory):
     job = await _get_job(db_factory, job_id)
     assert job.status == JobStatus.AWAITING_TITLE_SELECTION
     assert job.selected_title_id is None
+
+
+@pytest.mark.asyncio
+async def test_keep_title_503_no_rerun_queue(db_factory, tmp_path, monkeypatch):
+    """If rerun_queue is absent from app.state, keep-title returns 503 rather
+    than raising an AttributeError, and — since the queue check now runs
+    before any job mutation/commit/publish/cleanup — the job's DB row is left
+    completely unchanged, no event is published, and the discarded titles'
+    raw output is NOT deleted from disk."""
+    import jacques.api.routes.jobs as jobs_module
+
+    monkeypatch.setattr(jobs_module.settings, "temp_path", tmp_path)
+
+    async def _override_get_db():
+        async with db_factory() as session:
+            yield session
+
+    broadcaster = Broadcaster()
+    events_queue = broadcaster.subscribe()
+
+    app.dependency_overrides[get_db] = _override_get_db
+    app.state.job_events = broadcaster
+    if hasattr(app.state, "rerun_queue"):
+        del app.state.rerun_queue
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            job_id = await _create_job(
+                db_factory,
+                status=JobStatus.AWAITING_TITLE_SELECTION,
+                titles_json=_TWO_TITLES,
+                error_message="stale error",
+                progress=10,
+            )
+
+            other_dir = tmp_path / str(job_id) / "raw" / "0"
+            other_dir.mkdir(parents=True)
+            (other_dir / "title.mkv").write_bytes(b"raw content")
+
+            response = await client.post(f"/api/jobs/{job_id}/keep-title/1")
+
+        assert response.status_code == 503
+        assert "not ready" in response.json()["detail"].lower()
+
+        job = await _get_job(db_factory, job_id)
+        assert job.status == JobStatus.AWAITING_TITLE_SELECTION
+        assert job.selected_title_id is None
+        assert job.progress == 10
+        assert job.error_message == "stale error"
+
+        # The discarded title's raw output must NOT have been cleaned up,
+        # since the request never got past the queue-availability check.
+        assert other_dir.exists()
+
+        assert events_queue.empty()
+    finally:
+        app.dependency_overrides.clear()
+        if hasattr(app.state, "rerun_queue"):
+            del app.state.rerun_queue
+        if hasattr(app.state, "job_events"):
+            del app.state.job_events
 
 
 @pytest.mark.asyncio

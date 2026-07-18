@@ -210,15 +210,16 @@ async def rerun_job(
                 detail="No completed transcoded files found for this job",
             )
 
+    queue = getattr(request.app.state, "rerun_queue", None)
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
     job.status = target_status
     job.error_message = None
     job.progress = 0
     await db.commit()
     publish_job_event(getattr(request.app.state, "job_events", None), job)
 
-    queue = getattr(request.app.state, "rerun_queue", None)
-    if queue is None:
-        raise HTTPException(status_code=503, detail="Service not ready")
     await queue.put((job_id, target_status))
 
     return JSONResponse(status_code=202, content={"job_id": job_id, "stage": stage})
@@ -263,6 +264,12 @@ async def select_match(
     fully_paused = job.status == JobStatus.AWAITING_SELECTION
     still_ripping = job.status == JobStatus.RIPPING_AWAITING_SELECTION
 
+    queue = None
+    if fully_paused:
+        queue = getattr(request.app.state, "rerun_queue", None)
+        if queue is None:
+            raise HTTPException(status_code=503, detail="Service not ready")
+
     job.title = title
     job.year = year
     job.tmdb_id = tmdb_id
@@ -278,9 +285,6 @@ async def select_match(
     publish_job_event(getattr(request.app.state, "job_events", None), job)
 
     if fully_paused:
-        queue = getattr(request.app.state, "rerun_queue", None)
-        if queue is None:
-            raise HTTPException(status_code=503, detail="Service not ready")
         await queue.put((job_id, JobStatus.TRANSCODING))
 
     return JSONResponse(status_code=202, content={"job_id": job_id, "tmdb_id": tmdb_id})
@@ -323,6 +327,10 @@ async def assign_episodes(
             detail_parts.append(f"unknown title_ids: {sorted(extra)}")
         raise HTTPException(status_code=400, detail="; ".join(detail_parts))
 
+    queue = getattr(request.app.state, "rerun_queue", None)
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
     job.episode_assignments = json.dumps({
         str(a.title_id): {"season": a.season, "episode": a.episode, "name": a.name}
         for a in body
@@ -333,9 +341,6 @@ async def assign_episodes(
     await db.commit()
     publish_job_event(getattr(request.app.state, "job_events", None), job)
 
-    queue = getattr(request.app.state, "rerun_queue", None)
-    if queue is None:
-        raise HTTPException(status_code=503, detail="Service not ready")
     await queue.put((job_id, JobStatus.TRANSCODING))
 
     return JSONResponse(status_code=202, content={"job_id": job_id, "assigned": len(body)})
@@ -359,6 +364,10 @@ async def keep_title(
     if title_id not in parsed_title_ids:
         raise HTTPException(status_code=400, detail=f"Unknown title_id {title_id}")
 
+    queue = getattr(request.app.state, "rerun_queue", None)
+    if queue is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+
     job.selected_title_id = title_id
     job.status = JobStatus.TRANSCODING
     job.progress = 0
@@ -376,9 +385,6 @@ async def keep_title(
     await db.commit()
     publish_job_event(getattr(request.app.state, "job_events", None), job)
 
-    queue = getattr(request.app.state, "rerun_queue", None)
-    if queue is None:
-        raise HTTPException(status_code=503, detail="Service not ready")
     await queue.put((job_id, JobStatus.TRANSCODING))
 
     return JSONResponse(status_code=202, content={"job_id": job_id, "title_id": title_id})
