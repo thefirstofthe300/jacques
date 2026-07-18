@@ -46,11 +46,14 @@ async def _fetch_metadata(
     job_id: int, disc_label: str | None, disc_type_hint: DiscType, metadata_svc: MetadataService
 ) -> MediaInfo | None:
     """Fetch TMDb metadata. Runs concurrently with ripping — does not touch job.status
-    except to flag RIPPING_AWAITING_SELECTION if the match is ambiguous, since the rip
-    side owns job.status otherwise during this window (see comment in _run_pipeline).
+    except to flag RIPPING_AWAITING_SELECTION when the match is ambiguous or when TMDb
+    found no match at all (both need the user to pick or enter a TMDb ID manually),
+    since the rip side owns job.status otherwise during this window (see comment in
+    _run_pipeline).
 
-    Returns the resolved MediaInfo if unambiguous, or None if ambiguous (candidates are
-    stored on the job for user selection) or no match was found at all.
+    Returns the resolved MediaInfo if unambiguous, or None if ambiguous or no match was
+    found — both cases store an empty or populated candidates list on the job for user
+    selection/manual entry.
     """
     log.info("Job %d: fetching metadata for %r", job_id, disc_label)
     media_info = await metadata_svc.identify(disc_label or "", disc_type_hint)
@@ -80,6 +83,12 @@ async def _fetch_metadata(
             tmdb_id=media_info.tmdb_id,
         )
         return media_info
+
+    await _update_job(job_id, candidates="[]", status=JobStatus.RIPPING_AWAITING_SELECTION)
+    log.info(
+        "Job %d: no TMDb match found — awaiting manual selection (rip continues in background)",
+        job_id,
+    )
     return None
 
 

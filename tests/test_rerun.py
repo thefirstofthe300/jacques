@@ -11,6 +11,7 @@ test_pipeline.py and monkeypatches jacques.daemon.settings.temp_path so that
 temp-file probing goes to pytest's tmp_path instead of the real filesystem.
 """
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -199,7 +200,7 @@ async def test_rerun_from_fetching_metadata_loads_disc_type_from_db(db_factory, 
 
     async def spy_identify(label, disc_type):
         captured_calls.append((label, disc_type))
-        return None  # no metadata match — still reaches COMPLETE
+        return None  # no metadata match — pauses at AWAITING_SELECTION
 
     mock_ripper = MagicMock()
     mock_ripper.get_disc_info = AsyncMock()
@@ -231,7 +232,8 @@ async def test_rerun_from_fetching_metadata_loads_disc_type_from_db(db_factory, 
     assert captured_calls[0] == ("SHOW_DISC", DiscType.TV_SHOW)
 
     job = await _get_job(db_factory, job_id)
-    assert job.status == JobStatus.COMPLETE
+    assert job.status == JobStatus.AWAITING_SELECTION
+    assert json.loads(job.candidates) == []
 
 
 # ── _run_pipeline integration tests — start_stage=TRANSCODING ─────────────────
@@ -485,7 +487,8 @@ async def test_rerun_from_fetching_metadata_with_raw_files_does_not_transcode(db
     """With start_stage=FETCHING_METADATA, raw_paths are NOT pre-loaded from disk
     (only TRANSCODING/ORGANIZING entry points pre-load them). Even if raw files exist,
     transcode is never called — ripping produces nothing (no titles_to_rip from
-    the skipped IDENTIFYING stage), so the pipeline reaches COMPLETE with no files moved."""
+    the skipped IDENTIFYING stage), and since TMDb finds no match here either, the
+    pipeline pauses at AWAITING_SELECTION rather than reaching COMPLETE."""
     from jacques import config, daemon
 
     _apply_settings(config.settings, tmp_path)
@@ -522,7 +525,8 @@ async def test_rerun_from_fetching_metadata_with_raw_files_does_not_transcode(db
     mock_transcoder.transcode.assert_not_called()
 
     job = await _get_job(db_factory, job_id)
-    assert job.status == JobStatus.COMPLETE
+    assert job.status == JobStatus.AWAITING_SELECTION
+    assert json.loads(job.candidates) == []
 
 
 # ── _process_reruns() tests ────────────────────────────────────────────────────
