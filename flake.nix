@@ -192,6 +192,67 @@
           wordsegment
         ];
 
+        # Svelte + Vite SPA that replaced the old Jinja2/HTMX dashboard.
+        # `jacques/api/app.py` serves it from a `static/` directory sibling to
+        # the installed package's Python files, so it has to be built and
+        # baked into jacquesApp below.
+        #
+        # frontend/vite.config.js sets `build.outDir` to `../jacques/static`
+        # -- relative to frontend/'s cwd during `vite build`, which escapes
+        # the frontend/ directory entirely and lands at a `jacques/static`
+        # directory *sibling* to frontend/ (i.e. the repo root's jacques/
+        # package directory). buildNpmPackage normally expects the build's
+        # output inside the package directory itself (e.g. dist/), so pulling
+        # in only `./frontend` as src would leave that `../jacques` path
+        # resolving to nothing but bare scratch space outside the checkout.
+        # Instead, pull in the whole repo as src and build from the
+        # frontend/ subdirectory (via sourceRoot) so the escaping relative
+        # path resolves to a real `jacques/static` inside the same copied
+        # source tree -- which is exactly what installPhase then copies out
+        # of. This only touches the isolated build's copy of the repo, never
+        # the real working tree.
+        jacquesFrontend = pkgs.buildNpmPackage {
+          pname = "jacques-frontend";
+          version = "0.1.0";
+          # The default unpackPhase copies a directory `src` into the build
+          # top under a name derived from its store path's own "name"
+          # component (via `stripHash`). A bare `./.` gets an unpredictable
+          # store-path name, so pin it explicitly with `builtins.path` --
+          # that makes `sourceRoot` below (which must name that directory
+          # exactly to cd into frontend/) stable and known ahead of time.
+          # This same `src`/`sourceRoot` pair is also handed to
+          # buildNpmPackage's internal fixed-output derivation that
+          # prefetches npm deps for npmDepsHash, which only forwards `src`
+          # and `sourceRoot` (not arbitrary phases) -- so it must resolve
+          # correctly through the default unpackPhase alone, with no custom
+          # unpackPhase override.
+          src = builtins.path {
+            path = ./.;
+            name = "jacques-source";
+          };
+          sourceRoot = "jacques-source/frontend";
+
+          # Computed from frontend/package-lock.json; update by running
+          # `nix build .#jacques`, which fails with the actual hash to paste
+          # in whenever package-lock.json changes.
+          npmDepsHash = "sha256-sRPYmja4HXQDHv/Y6IWbFDDVmMZQkT3UjE/1+nTRghY=";
+
+          # unpackPhase only chmods sourceRoot (jacques-source/frontend)
+          # writable; the escaped outDir's sibling `jacques/static/` is still
+          # a read-only copy from the store (it only contains a tracked
+          # `.gitkeep`), and Vite's `emptyOutDir` needs to delete it before
+          # writing the build there.
+          postPatch = ''
+            chmod -R u+w ../jacques/static
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            cp -r ../jacques/static $out
+            runHook postInstall
+          '';
+        };
+
         jacquesApp = python.pkgs.buildPythonApplication {
           pname = "jacques";
           version = "0.1.0";
@@ -206,12 +267,18 @@
 
           # Bake the external binary paths into the wrapper so makemkvcon and
           # HandBrakeCLI are always available, independent of the system PATH.
+          # Also bake the built frontend into the installed package's
+          # static/ directory, replacing the empty/placeholder one that ships
+          # in the sdist, so app.py's StaticFiles mount serves real assets.
           postInstall = ''
             wrapProgram $out/bin/jacques \
               --prefix PATH : ${pkgs.lib.makeBinPath [
                 pkgs.makemkv   # provides makemkvcon
                 pkgs.handbrake # provides HandBrakeCLI
               ]}
+
+            rm -rf $out/${python.sitePackages}/jacques/static
+            cp -r ${jacquesFrontend} $out/${python.sitePackages}/jacques/static
           '';
 
           # Unit tests pass without hardware; the subset that call makemkvcon /
@@ -255,6 +322,7 @@
             pkgs.uv
             pkgs.makemkv
             pkgs.handbrake
+            pkgs.nodejs # npm is bundled with nodejs in nixpkgs
           ];
 
           shellHook = ''
@@ -263,8 +331,11 @@
             printf "  uv:           %s\n" "$(uv --version 2>/dev/null || echo 'not found')"
             printf "  makemkvcon:   %s\n" "$(command -v makemkvcon  2>/dev/null || echo 'not found')"
             printf "  HandBrakeCLI: %s\n" "$(command -v HandBrakeCLI 2>/dev/null || echo 'not found')"
+            printf "  node:         %s\n" "$(node --version 2>/dev/null || echo 'not found')"
+            printf "  npm:          %s\n" "$(npm --version 2>/dev/null || echo 'not found')"
             echo ""
             echo "Run 'uv sync --group dev' to set up the virtual environment."
+            echo "Run 'cd frontend && npm install' to set up frontend tooling."
           '';
         };
       });
