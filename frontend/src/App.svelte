@@ -1,14 +1,11 @@
 <script>
   import { onMount } from 'svelte';
-  import { listJobs } from './lib/api.js';
   import { connectJobStream } from './lib/sse.js';
   import { jobList, setJobs, upsertJob, removeJob } from './lib/store.js';
   import JobCard from './components/JobCard.svelte';
 
   onMount(() => {
-    listJobs().then(setJobs);
-
-    const stream = connectJobStream({ onUpsert: upsertJob, onDelete: removeJob });
+    const stream = connectJobStream({ onResync: setJobs, onUpsert: upsertJob, onDelete: removeJob });
     return () => stream.close();
   });
 </script>

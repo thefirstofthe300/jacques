@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { listJobs } from './api.js';
 import { connectJobStream } from './sse.js';
+
+vi.mock('./api.js', () => ({
+  listJobs: vi.fn(),
+}));
 
 class FakeEventSource {
   constructor(url) {
@@ -26,10 +31,39 @@ describe('connectJobStream', () => {
   beforeEach(() => {
     FakeEventSource.instances = [];
     vi.stubGlobal('EventSource', FakeEventSource);
+    listJobs.mockReset();
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it('fetches a fresh snapshot via listJobs and calls onResync when the connection opens', async () => {
+    const jobs = [{ id: 1, status: 'RIPPING' }];
+    listJobs.mockResolvedValue(jobs);
+    const onResync = vi.fn();
+    connectJobStream({ onResync });
+
+    FakeEventSource.instances[0].dispatch('open');
+    await vi.waitFor(() => expect(onResync).toHaveBeenCalledWith(jobs));
+
+    expect(listJobs).toHaveBeenCalledOnce();
+  });
+
+  it('resyncs again on reconnect (native EventSource fires open on every reconnect)', async () => {
+    const onResync = vi.fn();
+    listJobs.mockResolvedValueOnce([{ id: 1, status: 'RIPPING' }]);
+    connectJobStream({ onResync });
+
+    FakeEventSource.instances[0].dispatch('open');
+    await vi.waitFor(() => expect(onResync).toHaveBeenCalledTimes(1));
+
+    listJobs.mockResolvedValueOnce([{ id: 1, status: 'TRANSCODING' }]);
+    FakeEventSource.instances[0].dispatch('open');
+    await vi.waitFor(() => expect(onResync).toHaveBeenCalledTimes(2));
+
+    expect(onResync).toHaveBeenNthCalledWith(1, [{ id: 1, status: 'RIPPING' }]);
+    expect(onResync).toHaveBeenNthCalledWith(2, [{ id: 1, status: 'TRANSCODING' }]);
   });
 
   it('opens an EventSource against /api/jobs/stream', () => {
