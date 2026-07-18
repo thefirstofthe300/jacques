@@ -6,6 +6,10 @@ dist/
 build/
 .venv/
 
+# Frontend (built assets land in jacques/static/, not committed)
+jacques/static/
+frontend/node_modules/
+
 # Runtime state
 *.db
 *.db-journal
