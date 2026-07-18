@@ -577,10 +577,16 @@ async def test_pipeline_marks_failed_on_transcode_error(db_factory, tmp_path):
     mock_transcoder = MagicMock()
     mock_transcoder.transcode = AsyncMock(side_effect=RuntimeError("HandBrakeCLI exited with code 1"))
 
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock(
+        return_value=MediaInfo(title="Film", year=2020, disc_type=DiscType.MOVIE, tmdb_id=1)
+    )
+
     with (
         patch("jacques.daemon.AsyncSessionLocal", db_factory),
         patch("jacques.daemon.Ripper", return_value=mock_ripper),
         patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
     ):
         job_id = await _create_job(db_factory, "/dev/sr0", "FILM")
         await daemon._run_pipeline(job_id, "/dev/sr0", "FILM")
@@ -591,8 +597,10 @@ async def test_pipeline_marks_failed_on_transcode_error(db_factory, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pipeline_organizes_without_metadata(db_factory, tmp_path):
-    """When TMDb returns no match, files should land in Unknown/ using disc_label."""
+async def test_pipeline_pauses_for_manual_selection_when_no_tmdb_match(db_factory, tmp_path):
+    """When TMDb returns no match at all, the pipeline should pause at
+    AWAITING_SELECTION (with an empty candidates list) so the user can search or
+    enter a TMDb ID manually, rather than silently organizing into Unknown/."""
     from jacques import config, daemon
 
     _apply_settings(config.settings, tmp_path)
@@ -605,10 +613,6 @@ async def test_pipeline_organizes_without_metadata(db_factory, tmp_path):
         mkv.write_bytes(b"raw")
         return mkv
 
-    async def fake_transcode(input_path, output_path, on_progress=None):
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(b"h265")
-
     mock_ripper = MagicMock()
     mock_ripper.get_disc_info = AsyncMock(return_value=[movie_title])
     mock_ripper.select_main_title = MagicMock(return_value=movie_title)
@@ -616,7 +620,7 @@ async def test_pipeline_organizes_without_metadata(db_factory, tmp_path):
     mock_ripper.rip = fake_rip
 
     mock_transcoder = MagicMock()
-    mock_transcoder.transcode = fake_transcode
+    mock_transcoder.transcode = AsyncMock()
 
     mock_metadata = MagicMock()
     mock_metadata.identify = AsyncMock(return_value=None)
@@ -631,10 +635,9 @@ async def test_pipeline_organizes_without_metadata(db_factory, tmp_path):
         await daemon._run_pipeline(job_id, "/dev/sr0", "MYSTERY_DISC")
 
     job = await _get_job(db_factory, job_id)
-    assert job.status == JobStatus.COMPLETE
-
-    expected = tmp_path / "library" / "Unknown" / "MYSTERY_DISC.mkv"
-    assert expected.exists()
+    assert job.status == JobStatus.AWAITING_SELECTION
+    assert json.loads(job.candidates) == []
+    mock_transcoder.transcode.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1951,7 +1954,9 @@ async def test_pipeline_cleans_up_temp_dir_on_success(db_factory, tmp_path):
     mock_transcoder.transcode = fake_transcode
 
     mock_metadata = MagicMock()
-    mock_metadata.identify = AsyncMock(return_value=None)
+    mock_metadata.identify = AsyncMock(
+        return_value=MediaInfo(title="Film", year=2020, disc_type=DiscType.MOVIE, tmdb_id=1)
+    )
 
     with (
         patch("jacques.daemon.AsyncSessionLocal", db_factory),
