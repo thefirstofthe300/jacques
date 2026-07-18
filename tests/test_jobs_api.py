@@ -156,6 +156,67 @@ async def test_get_job_serializes_empty_defaults(api_client, db_factory):
     assert body["selected_title_id"] is None
 
 
+# ── GET /api/jobs/{job_id}/candidates ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_candidates_200_maps_search_results(api_client, db_factory):
+    """Valid disc_type: MetadataService.search is called with the job's
+    disc_label and the parsed disc_type, and results are mapped to the
+    expected JSON shape."""
+    job_id = await _create_job(db_factory, disc_label="THE_MATRIX")
+
+    fake_results = [
+        MediaInfo(title="The Matrix", year=1999, disc_type=DiscType.MOVIE, tmdb_id=603, overview="A hacker."),
+        MediaInfo(title="The Matrix Reloaded", year=2003, disc_type=DiscType.MOVIE, tmdb_id=604, overview="More."),
+    ]
+
+    with patch("jacques.api.routes.jobs.MetadataService") as mock_cls:
+        mock_cls.return_value.search = AsyncMock(return_value=fake_results)
+        response = await api_client.get(f"/api/jobs/{job_id}/candidates", params={"disc_type": "movie"})
+
+    assert response.status_code == 200
+    mock_cls.return_value.search.assert_awaited_once_with("THE_MATRIX", DiscType.MOVIE)
+    assert response.json() == [
+        {"title": "The Matrix", "year": 1999, "disc_type": "movie", "tmdb_id": 603, "overview": "A hacker."},
+        {"title": "The Matrix Reloaded", "year": 2003, "disc_type": "movie", "tmdb_id": 604, "overview": "More."},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_candidates_200_empty_disc_label(api_client, db_factory):
+    """A job with no disc_label still calls search, passing an empty string."""
+    job_id = await _create_job(db_factory, disc_label=None)
+
+    with patch("jacques.api.routes.jobs.MetadataService") as mock_cls:
+        mock_cls.return_value.search = AsyncMock(return_value=[])
+        response = await api_client.get(f"/api/jobs/{job_id}/candidates", params={"disc_type": "tv_show"})
+
+    assert response.status_code == 200
+    assert response.json() == []
+    mock_cls.return_value.search.assert_awaited_once_with("", DiscType.TV_SHOW)
+
+
+@pytest.mark.asyncio
+async def test_candidates_400_invalid_disc_type(api_client, db_factory):
+    """An unrecognized disc_type returns 400 and never calls MetadataService."""
+    job_id = await _create_job(db_factory)
+
+    with patch("jacques.api.routes.jobs.MetadataService") as mock_cls:
+        response = await api_client.get(f"/api/jobs/{job_id}/candidates", params={"disc_type": "not_a_type"})
+        mock_cls.assert_not_called()
+
+    assert response.status_code == 400
+    assert "not_a_type" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_candidates_404_job_not_found(api_client):
+    response = await api_client.get("/api/jobs/99999/candidates", params={"disc_type": "movie"})
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()
+
+
 # ── 404 — job not found ───────────────────────────────────────────────────────
 
 

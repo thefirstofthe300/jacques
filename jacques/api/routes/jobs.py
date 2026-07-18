@@ -72,6 +72,14 @@ class JobResponse(BaseModel):
         )
 
 
+class CandidateResponse(BaseModel):
+    title: str
+    year: int | None
+    disc_type: str
+    tmdb_id: int
+    overview: str | None
+
+
 def publish_job_event(broadcaster, job: Job, event_type: str = "job_upserted") -> None:
     """Publish a job-upserted event carrying the full job payload, if a
     broadcaster is wired up. No-ops if `broadcaster` is None (not yet set on
@@ -107,6 +115,36 @@ async def get_job(job_id: int, db: AsyncSession = Depends(get_db)) -> JobRespons
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return JobResponse.from_job(job)
+
+
+@router.get("/{job_id}/candidates", response_model=list[CandidateResponse])
+async def job_candidates(
+    job_id: int,
+    disc_type: str,
+    db: AsyncSession = Depends(get_db),
+) -> list[CandidateResponse]:
+    job = await db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    try:
+        search_type = DiscType(disc_type)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid disc_type: {disc_type!r}")
+
+    results = await MetadataService(settings.tmdb_api_key).search(
+        job.disc_label or "", search_type
+    )
+    return [
+        CandidateResponse(
+            title=r.title,
+            year=r.year,
+            disc_type=r.disc_type.value,
+            tmdb_id=r.tmdb_id,
+            overview=r.overview,
+        )
+        for r in results
+    ]
 
 
 @router.post("/{job_id}/rerun/{stage}", status_code=202)
