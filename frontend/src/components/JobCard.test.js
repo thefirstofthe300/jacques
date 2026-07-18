@@ -3,9 +3,18 @@ import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
 import JobCard from './JobCard.svelte';
 import { rerunStage, deleteJob } from '../lib/api.js';
 
+// Pause-point child components (DuplicateActions, CandidateSelector,
+// TitleSelector, EpisodeAssignmentForm) import from this same module, so the
+// mock must cover every export they use even though these tests only
+// exercise JobCard's own behavior.
 vi.mock('../lib/api.js', () => ({
   rerunStage: vi.fn(),
   deleteJob: vi.fn(),
+  rerip: vi.fn(),
+  getCandidates: vi.fn(),
+  selectMatch: vi.fn(),
+  keepTitle: vi.fn(),
+  assignEpisodes: vi.fn(),
 }));
 
 // @testing-library/svelte auto-registers cleanup via global beforeEach/afterEach
@@ -121,22 +130,21 @@ describe('JobCard', () => {
     expect(screen.queryByRole('button', { name: /Delete/ })).toBeNull();
   });
 
-  it('renders a placeholder for duplicate_detected instead of pause-point forms', () => {
+  it('renders the DuplicateActions pause-point form for duplicate_detected', () => {
     const job = makeJob({ status: 'duplicate_detected', is_active: true });
 
     const { container } = render(JobCard, { job });
 
-    const placeholder = container.querySelector('.pause-point-placeholder');
-    expect(placeholder).toBeTruthy();
-    expect(placeholder.dataset.status).toBe('duplicate_detected');
+    expect(container.querySelector('.duplicate-actions')).toBeTruthy();
+    expect(screen.getByText(/previously ripped/)).toBeTruthy();
   });
 
-  it('renders a placeholder for awaiting_selection', () => {
+  it('renders the CandidateSelector pause-point form for awaiting_selection', () => {
     const job = makeJob({ status: 'awaiting_selection', is_active: true });
 
     const { container } = render(JobCard, { job });
 
-    expect(container.querySelector('.pause-point-placeholder')).toBeTruthy();
+    expect(container.querySelector('.candidate-selector')).toBeTruthy();
   });
 
   it('does not show the progress bar while status is detected', () => {

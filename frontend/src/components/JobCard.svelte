@@ -1,9 +1,12 @@
 <script>
   // Renders a single job's status/progress/basic actions. Pause-point forms
   // (candidate select, title select, episode assignment, duplicate actions)
-  // are separate components that will slot into the placeholder below based
-  // on job.status — not implemented here.
+  // are dispatched below based on job.status.
   import { rerunStage, deleteJob } from '../lib/api.js';
+  import DuplicateActions from './DuplicateActions.svelte';
+  import CandidateSelector from './CandidateSelector.svelte';
+  import TitleSelector from './TitleSelector.svelte';
+  import EpisodeAssignmentForm from './EpisodeAssignmentForm.svelte';
 
   let { job } = $props();
 
@@ -30,19 +33,10 @@
     { stage: 'organizing', label: 'Organize', icon: 'bi-folder-symlink' },
   ];
 
-  const PAUSE_POINT_STATUSES = new Set([
-    'duplicate_detected',
-    'awaiting_selection',
-    'ripping_awaiting_selection',
-    'awaiting_title_selection',
-    'awaiting_episode_assignment',
-  ]);
-
   let statusClass = $derived(STATUS_CLASSES[job.status] ?? 'bg-secondary');
   let statusLabel = $derived(job.status.replaceAll('_', ' '));
   let showProgress = $derived(job.is_active && job.status !== 'detected');
   let showRetry = $derived(job.status === 'failed' || job.status === 'complete');
-  let showPausePoint = $derived(PAUSE_POINT_STATUSES.has(job.status));
   let createdAt = $derived(new Date(job.created_at).toLocaleString());
 
   function handleRerun(stage) {
@@ -106,8 +100,14 @@
       </div>
     {/if}
 
-    {#if showPausePoint}
-      <div class="pause-point-placeholder mt-3" data-status={job.status}></div>
+    {#if job.status === 'duplicate_detected'}
+      <DuplicateActions {job} />
+    {:else if job.status === 'awaiting_selection' || job.status === 'ripping_awaiting_selection'}
+      <CandidateSelector {job} />
+    {:else if job.status === 'awaiting_title_selection'}
+      <TitleSelector {job} />
+    {:else if job.status === 'awaiting_episode_assignment'}
+      <EpisodeAssignmentForm {job} />
     {/if}
 
     <div class="mt-2 small text-muted">
