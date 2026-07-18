@@ -16,6 +16,7 @@ from ...services.metadata import MetadataService
 _RERUN_ENTRY_STAGES: dict[str, JobStatus] = {
     "identifying": JobStatus.IDENTIFYING,
     "fetching_metadata": JobStatus.FETCHING_METADATA,
+    "ripping": JobStatus.RIPPING,
     "transcoding": JobStatus.TRANSCODING,
     "organizing": JobStatus.ORGANIZING,
 }
@@ -102,6 +103,12 @@ async def rerun_job(
             detail="Job is currently active; wait for it to finish before rerunning",
         )
 
+    if stage == "ripping" and not job.titles_json:
+        raise HTTPException(
+            status_code=409,
+            detail="No disc titles found for this job; rerun from identifying instead",
+        )
+
     if stage == "transcoding":
         done_marker = settings.temp_path / str(job_id) / "raw" / ".done"
         if not done_marker.exists():
@@ -143,7 +150,7 @@ async def select_match(
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    selectable = {JobStatus.AWAITING_SELECTION}
+    selectable = {JobStatus.AWAITING_SELECTION, JobStatus.RIPPING_AWAITING_SELECTION}
     if job.status not in selectable:
         raise HTTPException(status_code=409, detail="Job is not awaiting selection")
 
@@ -167,7 +174,8 @@ async def select_match(
         year = media_info.year
         disc_type = media_info.disc_type
 
-    was_paused = job.status == JobStatus.AWAITING_SELECTION
+    fully_paused = job.status == JobStatus.AWAITING_SELECTION
+    still_ripping = job.status == JobStatus.RIPPING_AWAITING_SELECTION
 
     job.title = title
     job.year = year
@@ -175,12 +183,14 @@ async def select_match(
     job.disc_type = disc_type
     job.candidates = None
     job.error_message = None
-    if was_paused:
+    if fully_paused:
         job.status = JobStatus.TRANSCODING
         job.progress = 0
+    elif still_ripping:
+        job.status = JobStatus.RIPPING
     await db.commit()
 
-    if was_paused:
+    if fully_paused:
         queue = getattr(request.app.state, "rerun_queue", None)
         if queue is None:
             raise HTTPException(status_code=503, detail="Service not ready")

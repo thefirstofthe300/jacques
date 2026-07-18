@@ -59,6 +59,13 @@ def test_is_active_true_for_ripping():
     assert job.is_active is True
 
 
+def test_is_active_true_for_ripping_awaiting_selection():
+    """A background rip subprocess is still running under this status, so it
+    must remain active (unlike the AWAITING_* pause statuses)."""
+    job = Job(drive_path="/dev/sr0", status=JobStatus.RIPPING_AWAITING_SELECTION)
+    assert job.is_active is True
+
+
 # ── parsed_candidates ─────────────────────────────────────────────────────────
 
 
