@@ -19,6 +19,7 @@ from jacques.daemon import _reset_interrupted_jobs, _titles_to_rip
 from jacques.database import get_db
 from jacques.models.job import DiscType, Job, JobStatus
 from jacques.models.ripped_disc import RippedDisc
+from jacques.services.discdb import DiscDBTitle, DiscMatch
 from jacques.services.metadata import MediaInfo
 from jacques.services.ripper import Ripper, TitleInfo
 
@@ -46,6 +47,31 @@ async def _create_job(db_factory, drive_path: str, disc_label: str | None) -> in
 async def _get_job(db_factory, job_id: int) -> Job:
     async with db_factory() as db:
         return await db.get(Job, job_id)
+
+
+@pytest.fixture(autouse=True)
+def mock_discdb(monkeypatch):
+    """Default the DiscDB integration to a safe no-op for every pipeline test.
+
+    Without this, `_run_pipeline`'s IDENTIFYING stage would call the real
+    `compute_content_hash` (opening the raw `/dev/sr0` device node) and, on a
+    hash, the real `DiscDBService.identify_by_hash` (a genuine outbound HTTPS
+    request to thediscdb.com) — both forbidden by this repo's test convention
+    of zero real hardware/network access (see CLAUDE.md).
+
+    Applies automatically to every test in this file, including ones that
+    predate the DiscDB integration and never asked for it. Tests exercising
+    the DiscDB-hit path override `compute_content_hash`'s return value via
+    `monkeypatch.setattr` themselves and set the return value on this
+    fixture's `identify_by_hash` mock.
+    """
+    monkeypatch.setattr("jacques.daemon.compute_content_hash", MagicMock(return_value=None))
+
+    mock_discdb_service = MagicMock()
+    mock_discdb_service.identify_by_hash = AsyncMock(return_value=None)
+    monkeypatch.setattr("jacques.daemon.DiscDBService", MagicMock(return_value=mock_discdb_service))
+
+    return mock_discdb_service
 
 
 # ── _titles_to_rip unit tests ─────────────────────────────────────────────────
@@ -2726,3 +2752,486 @@ async def test_pipeline_ripped_disc_insertion_is_idempotent(db_factory, tmp_path
         )
 
     assert count_after_second == 1
+
+
+# ── DiscDB integration tests ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pipeline_discdb_match_short_circuits_tmdb(db_factory, tmp_path, mock_discdb, monkeypatch):
+    """When compute_content_hash yields a hash and DiscDB resolves a match, the
+    job's title/year/tmdb_id/disc_type come from that match and TMDb
+    (MetadataService.identify) is never invoked."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+    monkeypatch.setattr("jacques.daemon.compute_content_hash", MagicMock(return_value="abc123"))
+
+    movie_title = TitleInfo(0, "Main Feature", 7200, "title_t00.mkv", 24, source_file="00800.mpls")
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / "title_t00.mkv"
+        mkv.write_bytes(b"fake raw mkv")
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"fake h265 mkv")
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=[movie_title])
+    mock_ripper.select_main_title = MagicMock(return_value=movie_title)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock()
+
+    # titles=[] means the title-selection join can't match anything (falls back
+    # to the heuristic, which is fine — this test is only about metadata).
+    mock_discdb.identify_by_hash = AsyncMock(return_value=DiscMatch(
+        media_info=MediaInfo(title="Dune", year=2021, disc_type=DiscType.MOVIE, tmdb_id=438631),
+        titles=[],
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "DUNE")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "DUNE")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    assert job.title == "Dune"
+    assert job.year == 2021
+    assert job.disc_type == DiscType.MOVIE
+    assert job.tmdb_id == 438631
+    mock_metadata.identify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_discdb_miss_falls_back_to_tmdb(db_factory, tmp_path, mock_discdb, monkeypatch):
+    """A computed content hash with no DiscDB match must fall back to the
+    existing TMDb metadata flow exactly as before the DiscDB integration."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+    monkeypatch.setattr("jacques.daemon.compute_content_hash", MagicMock(return_value="nomatchhash"))
+    mock_discdb.identify_by_hash = AsyncMock(return_value=None)
+
+    mock_ripper, mock_transcoder, mock_metadata = _make_full_pipeline_mocks(tmp_path)
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "THE_MATRIX")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "THE_MATRIX")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    assert job.title == "The Matrix"
+    assert job.year == 1999
+    assert job.tmdb_id == 603
+    mock_metadata.identify.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_discdb_title_selection_full_coverage_skips_extras(
+    db_factory, tmp_path, mock_discdb, monkeypatch
+):
+    """When every MakeMKV title joins to a DiscDB title by source_file, only the
+    has_item=True titles (real content) are ripped — menus/trailers flagged
+    has_item=False are skipped even though MakeMKV returned them."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+    monkeypatch.setattr("jacques.daemon.compute_content_hash", MagicMock(return_value="abc123"))
+
+    menu = TitleInfo(0, "Menu", 20, "t00.mkv", source_file="00001.mpls")
+    feature = TitleInfo(1, "Main Feature", 7200, "t01.mkv", source_file="00002.mpls")
+    trailer = TitleInfo(2, "Trailer", 300, "t02.mkv", source_file="00003.mpls")
+
+    rip_calls: list[int] = []
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        rip_calls.append(title_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(f"raw-{title_id}".encode())
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(input_path.read_bytes())
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=[menu, feature, trailer])
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock()
+
+    mock_discdb.identify_by_hash = AsyncMock(return_value=DiscMatch(
+        media_info=MediaInfo(title="Feature Movie", year=2020, disc_type=DiscType.MOVIE, tmdb_id=1),
+        titles=[
+            DiscDBTitle(source_file="00001.mpls", has_item=False, title="Menu", type="", season=None, episode=None),
+            DiscDBTitle(source_file="00002.mpls", has_item=True, title="Feature Movie", type="Movie", season=None, episode=None),
+            DiscDBTitle(source_file="00003.mpls", has_item=False, title="Trailer", type="", season=None, episode=None),
+        ],
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "FEATURE_MOVIE")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "FEATURE_MOVIE")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    # Only the has_item=True title (the main feature) was ripped.
+    assert rip_calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_discdb_title_selection_gate_fails_closed_on_unmatched_title(
+    db_factory, tmp_path, mock_discdb, monkeypatch
+):
+    """If even one MakeMKV title fails to join to a DiscDB title (e.g. a
+    source_file with no counterpart), the whole DiscDB-driven selection is
+    distrusted and the pipeline falls back to the existing heuristic-based
+    title selection — identical to having no disc_match at all."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+    monkeypatch.setattr("jacques.daemon.compute_content_hash", MagicMock(return_value="abc123"))
+
+    candidates = [
+        TitleInfo(0, "Title A", 7200, "t00.mkv", 1, source_file="00001.mpls"),
+        TitleInfo(1, "Title B", 6900, "t01.mkv", 1, source_file="00002.mpls"),
+    ]
+
+    rip_calls: list[int] = []
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        rip_calls.append(title_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(f"raw-{title_id}".encode())
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(input_path.read_bytes())
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=candidates)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.has_ambiguous_main_feature = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock()
+
+    # Only title 0's source_file has a DiscDB counterpart — title 1's
+    # "00002.mpls" is absent, so the join must fail closed for the whole disc.
+    mock_discdb.identify_by_hash = AsyncMock(return_value=DiscMatch(
+        media_info=MediaInfo(title="Ambiguous Movie", year=2020, disc_type=DiscType.MOVIE, tmdb_id=1),
+        titles=[
+            DiscDBTitle(source_file="00001.mpls", has_item=True, title="A", type="Movie", season=None, episode=None),
+        ],
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        # Pre-populate selected_title_id so the ambiguous-movie pause doesn't
+        # intercept the run — same as the equivalent non-DiscDB test, since
+        # this test is about title *selection*, not the pause/resume flow.
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="AMBIGUOUS_MOVIE",
+                status=JobStatus.DETECTED,
+                selected_title_id=0,
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
+        await daemon._run_pipeline(job_id, "/dev/sr0", "AMBIGUOUS_MOVIE")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    # Same outcome as the heuristic without any DiscDB match: both candidates
+    # ripped since neither is flagged as the main feature.
+    assert rip_calls == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_discdb_tv_episode_assignments_prefilled_when_complete(
+    db_factory, tmp_path, mock_discdb, monkeypatch
+):
+    """A TV disc where every selected title's joined DiscDB title has both
+    season and episode set must have episode_assignments pre-filled and must
+    NOT pause at AWAITING_EPISODE_ASSIGNMENT."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+    monkeypatch.setattr("jacques.daemon.compute_content_hash", MagicMock(return_value="abc123"))
+
+    episodes = [
+        TitleInfo(0, "Episode 1", 2700, "t00.mkv", 4, source_file="00001.mpls"),
+        TitleInfo(1, "Episode 2", 2640, "t01.mkv", 4, source_file="00002.mpls"),
+    ]
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(b"raw episode")
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"h265 episode")
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=episodes)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock()
+
+    mock_discdb.identify_by_hash = AsyncMock(return_value=DiscMatch(
+        media_info=MediaInfo(title="Breaking Bad", year=2008, disc_type=DiscType.TV_SHOW, tmdb_id=1396),
+        titles=[
+            DiscDBTitle(source_file="00001.mpls", has_item=True, title="Pilot", type="Series", season=1, episode=1),
+            DiscDBTitle(source_file="00002.mpls", has_item=True, title="Cat's in the Bag...", type="Series", season=1, episode=2),
+        ],
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "BREAKING_BAD_S1")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "BREAKING_BAD_S1")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    assert job.parsed_episode_assignments == {
+        "0": {"season": 1, "episode": 1, "name": "Pilot"},
+        "1": {"season": 1, "episode": 2, "name": "Cat's in the Bag..."},
+    }
+
+    season_dir = tmp_path / "library" / "TV Shows" / "Breaking Bad (2008)" / "Season 01"
+    assert (season_dir / "Breaking Bad - S01E01 - Pilot.mkv").exists()
+    assert (season_dir / "Breaking Bad - S01E02 - Cat's in the Bag....mkv").exists()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_discdb_tv_episode_assignments_not_prefilled_when_incomplete(
+    db_factory, tmp_path, mock_discdb, monkeypatch
+):
+    """If any selected title's joined DiscDB title is missing season or
+    episode, episode_assignments must NOT be pre-filled, and the existing
+    AWAITING_EPISODE_ASSIGNMENT pause must still occur exactly as before this
+    feature existed."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+    monkeypatch.setattr("jacques.daemon.compute_content_hash", MagicMock(return_value="abc123"))
+
+    episodes = [
+        TitleInfo(0, "Episode 1", 2700, "t00.mkv", 4, source_file="00001.mpls"),
+        TitleInfo(1, "Episode 2", 2640, "t01.mkv", 4, source_file="00002.mpls"),
+    ]
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(b"raw episode")
+        return mkv
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=episodes)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = AsyncMock()
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock()
+
+    mock_discdb.identify_by_hash = AsyncMock(return_value=DiscMatch(
+        media_info=MediaInfo(title="Breaking Bad", year=2008, disc_type=DiscType.TV_SHOW, tmdb_id=1396),
+        titles=[
+            DiscDBTitle(source_file="00001.mpls", has_item=True, title="Pilot", type="Series", season=1, episode=1),
+            # Missing season/episode — the show's episode order isn't known
+            # for this title, so the pre-fill must not fire for the disc.
+            DiscDBTitle(source_file="00002.mpls", has_item=True, title="Cat's in the Bag...", type="Series", season=None, episode=None),
+        ],
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "BREAKING_BAD_S1")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "BREAKING_BAD_S1")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.AWAITING_EPISODE_ASSIGNMENT
+    assert not job.episode_assignments
+    mock_transcoder.transcode.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_discdb_movie_selected_title_prefilled_when_unambiguous(
+    db_factory, tmp_path, mock_discdb, monkeypatch
+):
+    """A movie disc with multiple ripped candidates where exactly one joined
+    DiscDB title is Movie-typed must have selected_title_id pre-filled and
+    must NOT pause at AWAITING_TITLE_SELECTION."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+    monkeypatch.setattr("jacques.daemon.compute_content_hash", MagicMock(return_value="abc123"))
+
+    candidates = [
+        TitleInfo(0, "Title A", 7200, "t00.mkv", source_file="00001.mpls"),
+        TitleInfo(1, "Title B", 6900, "t01.mkv", source_file="00002.mpls"),
+    ]
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(f"raw-{title_id}".encode())
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(input_path.read_bytes())
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=candidates)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock()
+
+    mock_discdb.identify_by_hash = AsyncMock(return_value=DiscMatch(
+        media_info=MediaInfo(title="Ambiguous Movie", year=2020, disc_type=DiscType.MOVIE, tmdb_id=1),
+        titles=[
+            DiscDBTitle(source_file="00001.mpls", has_item=True, title="Feature", type="Movie", season=None, episode=None),
+            DiscDBTitle(source_file="00002.mpls", has_item=True, title="Alternate Cut", type="", season=None, episode=None),
+        ],
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "AMBIGUOUS_MOVIE")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "AMBIGUOUS_MOVIE")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    assert job.selected_title_id == 0
+
+
+@pytest.mark.asyncio
+async def test_pipeline_discdb_movie_selected_title_not_prefilled_when_ambiguous(
+    db_factory, tmp_path, mock_discdb, monkeypatch
+):
+    """A movie disc where more than one joined DiscDB title is Movie-typed must
+    NOT pre-fill selected_title_id — the existing AWAITING_TITLE_SELECTION
+    pause must still occur exactly as before this feature existed."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+    monkeypatch.setattr("jacques.daemon.compute_content_hash", MagicMock(return_value="abc123"))
+
+    candidates = [
+        TitleInfo(0, "Title A", 7200, "t00.mkv", source_file="00001.mpls"),
+        TitleInfo(1, "Title B", 6900, "t01.mkv", source_file="00002.mpls"),
+    ]
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(f"raw-{title_id}".encode())
+        return mkv
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=candidates)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = AsyncMock()
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock()
+
+    # Both titles resolve as Movie-typed — DiscDB can't disambiguate the main
+    # feature any better than the heuristic could, so no pre-fill should occur.
+    mock_discdb.identify_by_hash = AsyncMock(return_value=DiscMatch(
+        media_info=MediaInfo(title="Ambiguous Movie", year=2020, disc_type=DiscType.MOVIE, tmdb_id=1),
+        titles=[
+            DiscDBTitle(source_file="00001.mpls", has_item=True, title="Feature", type="Movie", season=None, episode=None),
+            DiscDBTitle(source_file="00002.mpls", has_item=True, title="Alternate Cut", type="Movie", season=None, episode=None),
+        ],
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        job_id = await _create_job(db_factory, "/dev/sr0", "AMBIGUOUS_MOVIE")
+        await daemon._run_pipeline(job_id, "/dev/sr0", "AMBIGUOUS_MOVIE")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.AWAITING_TITLE_SELECTION
+    assert job.selected_title_id is None
+    mock_transcoder.transcode.assert_not_called()
