@@ -99,3 +99,32 @@ class Job(Base):
             return {}
         import json
         return json.loads(self.episode_assignments)
+
+    def to_response_dict(self) -> dict:
+        """Serialize this job into the API/SSE response shape.
+
+        Single source of truth for job->dict serialization, shared by the API
+        route layer (`JobResponse.from_job`) and the daemon's SSE broadcasts —
+        keeps the daemon from depending on the route layer for presentation
+        logic.
+        """
+        return {
+            "id": self.id,
+            "drive_path": self.drive_path,
+            "disc_label": self.disc_label,
+            "disc_uuid": self.disc_uuid,
+            "disc_type": self.disc_type.value,
+            "status": self.status.value,
+            "title": self.title,
+            "year": self.year,
+            "progress": self.progress,
+            "error_message": self.error_message,
+            "display_name": self.display_name,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "candidates": self.parsed_candidates,
+            "titles": self.parsed_titles,
+            "episode_assignments": self.parsed_episode_assignments,
+            "selected_title_id": self.selected_title_id,
+        }

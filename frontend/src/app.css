@@ -1,0 +1,63 @@
+/* Design language carried over from the old Jinja2/HTMX dashboard's
+   base.html, so the rewrite doesn't regress from a polished dark theme to
+   unstyled Bootstrap defaults. */
+
+body {
+  margin: 0;
+  background-color: #0d1117;
+  min-height: 100vh;
+}
+
+.navbar-brand {
+  font-weight: 700;
+  font-size: 1.25rem;
+  letter-spacing: -0.5px;
+}
+
+.app-shell {
+  max-width: 960px;
+}
+
+.job-card {
+  background-color: #161b22;
+  border-color: #30363d !important;
+  transition: border-color 0.15s ease;
+}
+
+.job-card:hover {
+  border-color: #58a6ff !important;
+}
+
+.progress {
+  background-color: #21262d;
+}
+
+.badge.status-badge {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.text-muted {
+  color: #8b949e !important;
+}
+
+.drive-path {
+  font-family: monospace;
+  font-size: 0.8rem;
+}
+
+/* Bootstrap's .btn-sm padding (0.25rem vertical + ~21px line-height) renders
+   at roughly 31px tall — fine for a mouse, tight for a fingertip. Bump the
+   tap target on coarse-pointer (touch) devices only, so the established
+   visual density of this dashboard is unchanged on desktop. */
+@media (pointer: coarse) {
+  .btn-sm {
+    min-height: 38px;
+    min-width: 38px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+}

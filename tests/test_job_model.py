@@ -4,10 +4,11 @@ These tests exercise pure-Python logic on Job instances directly — no DB or
 HTTP layer is needed, so no async fixtures are required.
 """
 import json
+from datetime import datetime, timezone
 
 import pytest
 
-from jacques.models.job import Job, JobStatus
+from jacques.models.job import DiscType, Job, JobStatus
 
 
 # ── is_active ─────────────────────────────────────────────────────────────────
@@ -173,3 +174,52 @@ def test_duplicate_detected_serializes_to_string():
     """
     assert JobStatus.DUPLICATE_DETECTED == "duplicate_detected"
     assert JobStatus.DUPLICATE_DETECTED.value == "duplicate_detected"
+
+
+# ── to_response_dict ────────────────────────────────────────────────────────
+
+
+def test_to_response_dict_shape():
+    """to_response_dict is the single source of truth for the job->dict shape
+    shared by JobResponse.from_job (API layer) and the daemon's SSE payloads —
+    both must depend downward on this rather than on each other."""
+    now = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    job = Job(
+        drive_path="/dev/sr0",
+        disc_label="MY_DISC",
+        disc_uuid="550e8400-e29b-41d4-a716-446655440000",
+        disc_type=DiscType.MOVIE,
+        status=JobStatus.TRANSCODING,
+        title="Fight Club",
+        year=1999,
+        progress=42,
+        error_message=None,
+        candidates=json.dumps([{"tmdb_id": 550, "title": "Fight Club", "year": 1999, "disc_type": "movie", "overview": ""}]),
+        titles_json=json.dumps([{"id": 0, "name": "Title 0", "duration_seconds": 5400, "expected_bytes": None}]),
+        episode_assignments=json.dumps({"0": {"season": 1, "episode": 1, "name": "Pilot"}}),
+        selected_title_id=0,
+    )
+    job.id = 1
+    job.created_at = now
+    job.updated_at = now
+
+    assert job.to_response_dict() == {
+        "id": 1,
+        "drive_path": "/dev/sr0",
+        "disc_label": "MY_DISC",
+        "disc_uuid": "550e8400-e29b-41d4-a716-446655440000",
+        "disc_type": "movie",
+        "status": "transcoding",
+        "title": "Fight Club",
+        "year": 1999,
+        "progress": 42,
+        "error_message": None,
+        "display_name": "Fight Club (1999)",
+        "is_active": True,
+        "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        "candidates": [{"tmdb_id": 550, "title": "Fight Club", "year": 1999, "disc_type": "movie", "overview": ""}],
+        "titles": [{"id": 0, "name": "Title 0", "duration_seconds": 5400, "expected_bytes": None}],
+        "episode_assignments": {"0": {"season": 1, "episode": 1, "name": "Pilot"}},
+        "selected_title_id": 0,
+    }

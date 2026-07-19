@@ -10,7 +10,6 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.111,<1.0",
     "uvicorn[standard]>=0.30",
-    "jinja2>=3.1",
     "python-multipart>=0.0.9",
     "sqlalchemy>=2.0",
     "aiosqlite>=0.20",
@@ -34,9 +33,6 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["jacques*"]
-
-[tool.setuptools.package-data]
-"jacques" = ["templates/**/*.html"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

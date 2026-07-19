@@ -6,6 +6,13 @@ dist/
 build/
 .venv/
 
+# Frontend (built assets land in jacques/static/, not committed; the
+# directory itself is tracked via jacques/static/.gitkeep so StaticFiles
+# has somewhere to mount before the frontend has ever been built)
+jacques/static/*
+!jacques/static/.gitkeep
+frontend/node_modules/
+
 # Runtime state
 *.db
 *.db-journal

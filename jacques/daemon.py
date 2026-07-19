@@ -15,6 +15,7 @@ from .config import settings
 from .database import AsyncSessionLocal, init_db
 from .models.job import DiscType, Job, JobStatus
 from .models.ripped_disc import RippedDisc
+from .services.broadcaster import Broadcaster
 from .services.detector import DiscDetector
 from .services.metadata import MediaInfo, MetadataService
 from .services.organizer import Organizer
@@ -32,6 +33,13 @@ async def _update_job(job_id: int, **kwargs: object) -> None:
         for key, value in kwargs.items():
             setattr(job, key, value)
         await db.commit()
+        # Serialize inside the session block — accessing job attributes after
+        # the session closes risks a lazy-load-after-close error.
+        job_payload = job.to_response_dict()
+
+    broadcaster = getattr(app.state, "job_events", None)
+    if broadcaster is not None:
+        broadcaster.publish({"type": "job_upserted", "job": job_payload})
 
 
 def _stage_progress(job_id: int, stage_index: int, stage_count: int):
@@ -544,6 +552,7 @@ async def run() -> None:
 
     job_queue: asyncio.Queue[tuple[str, str | None, str | None]] = asyncio.Queue()
     rerun_queue: asyncio.Queue[tuple[int, JobStatus]] = asyncio.Queue()
+    broadcaster = Broadcaster()
 
     async def _on_disc_inserted(drive_path: str, disc_label: str | None, disc_uuid: str | None) -> None:
         await job_queue.put((drive_path, disc_label, disc_uuid))
@@ -560,6 +569,7 @@ async def run() -> None:
     server = uvicorn.Server(server_config)
 
     app.state.rerun_queue = rerun_queue
+    app.state.job_events = broadcaster
 
     log.info("Web UI available at http://%s:%d", settings.host, settings.port)
 
