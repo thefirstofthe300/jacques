@@ -3235,3 +3235,238 @@ async def test_pipeline_discdb_movie_selected_title_not_prefilled_when_ambiguous
     assert job.status == JobStatus.AWAITING_TITLE_SELECTION
     assert job.selected_title_id is None
     mock_transcoder.transcode.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_discdb_title_selection_gate_fails_closed_on_empty_source_file(
+    db_factory, tmp_path, mock_discdb, monkeypatch
+):
+    """A MakeMKV title with source_file == "" (as opposed to a non-empty
+    source_file with no DiscDB counterpart) must also fail the all-or-nothing
+    join gate and fall back to the heuristic — the join must treat "" as "no
+    source_file" via truthiness, not merely as "no matching key"."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+    monkeypatch.setattr("jacques.daemon.compute_content_hash", MagicMock(return_value="abc123"))
+
+    candidates = [
+        TitleInfo(0, "Title A", 7200, "t00.mkv", 1, source_file="00001.mpls"),
+        TitleInfo(1, "Title B", 6900, "t01.mkv", 1, source_file=""),
+    ]
+
+    rip_calls: list[int] = []
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        rip_calls.append(title_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(f"raw-{title_id}".encode())
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(input_path.read_bytes())
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=candidates)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.has_ambiguous_main_feature = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock()
+
+    # Title 0's source_file has a DiscDB counterpart, but title 1's source_file
+    # is "" — the join must fail closed for the whole disc, same as an
+    # unmatched non-empty source_file.
+    mock_discdb.identify_by_hash = AsyncMock(return_value=DiscMatch(
+        media_info=MediaInfo(title="Ambiguous Movie", year=2020, disc_type=DiscType.MOVIE, tmdb_id=1),
+        titles=[
+            DiscDBTitle(source_file="00001.mpls", has_item=True, title="A", type="Movie", season=None, episode=None),
+        ],
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="AMBIGUOUS_MOVIE",
+                status=JobStatus.DETECTED,
+                selected_title_id=0,
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
+        await daemon._run_pipeline(job_id, "/dev/sr0", "AMBIGUOUS_MOVIE")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    # Same outcome as the heuristic without any DiscDB match: both candidates
+    # ripped since neither is flagged as the main feature.
+    assert rip_calls == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_pipeline_discdb_title_selection_falls_back_to_heuristic_when_no_titles(
+    db_factory, tmp_path, mock_discdb, monkeypatch
+):
+    """A disc_match with titles=[] (a metadata-only match with no per-title
+    map at all) must fall back to the heuristic for title *selection* — proven
+    here via which titles actually get ripped, not just via the resolved
+    metadata fields."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+    monkeypatch.setattr("jacques.daemon.compute_content_hash", MagicMock(return_value="abc123"))
+
+    candidates = [
+        TitleInfo(0, "Title A", 7200, "t00.mkv", 1, source_file="00001.mpls"),
+        TitleInfo(1, "Title B", 6900, "t01.mkv", 1, source_file="00002.mpls"),
+    ]
+
+    rip_calls: list[int] = []
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        rip_calls.append(title_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / f"t{title_id:02d}.mkv"
+        mkv.write_bytes(f"raw-{title_id}".encode())
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(input_path.read_bytes())
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=candidates)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.has_ambiguous_main_feature = MagicMock(return_value=True)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock()
+
+    mock_discdb.identify_by_hash = AsyncMock(return_value=DiscMatch(
+        media_info=MediaInfo(title="Ambiguous Movie", year=2020, disc_type=DiscType.MOVIE, tmdb_id=1),
+        titles=[],
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="AMBIGUOUS_MOVIE",
+                status=JobStatus.DETECTED,
+                selected_title_id=0,
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
+        await daemon._run_pipeline(job_id, "/dev/sr0", "AMBIGUOUS_MOVIE")
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    # Falls back to the heuristic exactly as if disc_match were None: both
+    # candidates ripped since neither is flagged as the main feature.
+    assert rip_calls == [0, 1]
+    # Metadata still resolves from the DiscDB match's media_info (titles=[]
+    # only defeats title *selection*, not metadata resolution).
+    assert job.title == "Ambiguous Movie"
+    mock_metadata.identify.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_resume_from_fetching_metadata_recomputes_disc_match(
+    db_factory, tmp_path, mock_discdb, monkeypatch
+):
+    """Resuming _run_pipeline at start_stage=FETCHING_METADATA (skipping
+    IDENTIFYING entirely) must still recompute content_hash and try DiscDB —
+    without this, a rerun starting at FETCHING_METADATA would silently never
+    get a hash to work with, even though drive_path is still available."""
+    from jacques import config, daemon
+
+    _apply_settings(config.settings, tmp_path)
+    monkeypatch.setattr("jacques.daemon.compute_content_hash", MagicMock(return_value="abc123"))
+
+    movie_title = TitleInfo(0, "Main Feature", 7200, "title_t00.mkv", 24)
+
+    async def fake_rip(title_id, output_dir, on_progress=None, expected_bytes=0):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        mkv = output_dir / "title_t00.mkv"
+        mkv.write_bytes(b"fake raw mkv")
+        return mkv
+
+    async def fake_transcode(input_path, output_path, on_progress=None):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"fake h265 mkv")
+
+    mock_ripper = MagicMock()
+    mock_ripper.get_disc_info = AsyncMock(return_value=[movie_title])
+    mock_ripper.select_main_title = MagicMock(return_value=movie_title)
+    mock_ripper.has_ambiguous_main_feature = MagicMock(return_value=False)
+    mock_ripper.is_tv_show_hint = MagicMock(return_value=False)
+    mock_ripper.rip = fake_rip
+
+    mock_transcoder = MagicMock()
+    mock_transcoder.transcode = fake_transcode
+
+    mock_metadata = MagicMock()
+    mock_metadata.identify = AsyncMock()
+
+    mock_discdb.identify_by_hash = AsyncMock(return_value=DiscMatch(
+        media_info=MediaInfo(title="Dune", year=2021, disc_type=DiscType.MOVIE, tmdb_id=438631),
+        titles=[],
+    ))
+
+    with (
+        patch("jacques.daemon.AsyncSessionLocal", db_factory),
+        patch("jacques.daemon.Ripper", return_value=mock_ripper),
+        patch("jacques.daemon.Transcoder", return_value=mock_transcoder),
+        patch("jacques.daemon.MetadataService", return_value=mock_metadata),
+    ):
+        async with db_factory() as db:
+            job = Job(
+                drive_path="/dev/sr0",
+                disc_label="DUNE",
+                status=JobStatus.FETCHING_METADATA,
+                disc_type=DiscType.MOVIE,
+                titles_json=json.dumps([dataclasses.asdict(movie_title)]),
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+
+        await daemon._run_pipeline(
+            job_id, "/dev/sr0", "DUNE", start_stage=JobStatus.FETCHING_METADATA
+        )
+
+    job = await _get_job(db_factory, job_id)
+    assert job.status == JobStatus.COMPLETE
+    assert job.title == "Dune"
+    assert job.year == 2021
+    assert job.tmdb_id == 438631
+    daemon.compute_content_hash.assert_called_once_with("/dev/sr0")
+    mock_discdb.identify_by_hash.assert_called_once_with("abc123")
+    mock_metadata.identify.assert_not_called()
