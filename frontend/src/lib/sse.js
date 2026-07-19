@@ -14,10 +14,17 @@
 // between the server registering the subscription and this client actually
 // being ready to receive them, and the backend's Broadcaster has no
 // replay/backlog for a queue that wasn't subscribed yet. To close that gap,
-// `onopen` (which fires on both the initial connection and every subsequent
-// auto-reconnect) fetches a fresh snapshot via `listJobs()` and hands it to
-// `onResync`, so the caller always has a chance to reseed its full job list
-// right as the live event stream picks up.
+// every connect/reconnect fetches a fresh snapshot via `listJobs()` and hands
+// it to `onResync`.
+//
+// The initial fetch happens immediately when this function is called, NOT
+// gated behind EventSource's `open` event — different browsers vary in when
+// (or whether) they consider a streaming response "open" if the server
+// hasn't sent any bytes yet, which it may not for a long time if nothing is
+// currently active. Gating the first load on `open` alone previously caused
+// the job list to never populate in that case. `open` still triggers a
+// resync on every reconnect after the first, since a dropped connection can
+// resume well after the initial load.
 
 import { listJobs } from './api.js';
 
@@ -29,6 +36,8 @@ import { listJobs } from './api.js';
  */
 export function connectJobStream(handlers = {}) {
   const eventSource = new EventSource('/api/jobs/stream');
+
+  listJobs().then((jobs) => handlers.onResync?.(jobs));
 
   eventSource.addEventListener('open', () => {
     listJobs().then((jobs) => handlers.onResync?.(jobs));

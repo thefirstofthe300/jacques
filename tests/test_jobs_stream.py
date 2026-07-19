@@ -83,6 +83,15 @@ class _FakeRequest:
         return self.disconnected
 
 
+async def _consume_initial_connected_frame(response) -> None:
+    """The generator's first yield is always the `: connected\\n\\n` keepalive
+    comment (sent immediately so the stream is unambiguously "open" even if
+    no real job event arrives for a long time) — consume it so tests can
+    assert on subsequent frames without hardcoding this one everywhere."""
+    frame = await asyncio.wait_for(response.body_iterator.__anext__(), timeout=1)
+    assert frame == ": connected\n\n"
+
+
 # ── SSE frame formatting ──────────────────────────────────────────────────────
 
 
@@ -96,6 +105,8 @@ async def test_stream_yields_job_update_frame_on_publish(broadcaster):
     assert response.media_type == "text/event-stream"
     assert response.headers["Cache-Control"] == "no-cache"
 
+    await _consume_initial_connected_frame(response)
+
     event = {"type": "job_upserted", "job": {"id": 42, "status": "ripping"}}
     broadcaster.publish(event)
 
@@ -108,6 +119,8 @@ async def test_stream_yields_job_update_frame_on_publish(broadcaster):
 async def test_stream_yields_job_deleted_frame(broadcaster):
     fake_request = _FakeRequest(broadcaster)
     response = await jobs_module.stream_jobs(fake_request)
+
+    await _consume_initial_connected_frame(response)
 
     event = {"type": "job_deleted", "job_id": 7}
     broadcaster.publish(event)
@@ -127,6 +140,8 @@ async def test_stream_unsubscribes_on_disconnect(broadcaster):
 
     assert len(broadcaster._subscribers) == 1
 
+    await _consume_initial_connected_frame(response)
+
     fake_request.disconnected = True
     with pytest.raises(StopAsyncIteration):
         await asyncio.wait_for(response.body_iterator.__anext__(), timeout=1)
@@ -143,6 +158,8 @@ async def test_stream_unsubscribes_even_if_generator_is_cancelled(broadcaster):
     response = await jobs_module.stream_jobs(fake_request)
 
     assert len(broadcaster._subscribers) == 1
+
+    await _consume_initial_connected_frame(response)
 
     task = asyncio.create_task(response.body_iterator.__anext__())
     await asyncio.sleep(0)  # let it reach the queue.get() wait

@@ -117,6 +117,13 @@ async def stream_jobs(request: Request) -> StreamingResponse:
 
     async def event_stream():
         try:
+            # Send an immediate byte so the connection is unambiguously
+            # "open" the moment a client subscribes, rather than leaving the
+            # response with zero bytes sent until the first real job event
+            # (which may be minutes away, or never, if nothing is currently
+            # active) — some browsers don't reliably fire EventSource's
+            # `open` event on a response that hasn't sent anything yet.
+            yield ": connected\n\n"
             while True:
                 if await request.is_disconnected():
                     break

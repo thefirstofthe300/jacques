@@ -32,38 +32,45 @@ describe('connectJobStream', () => {
     FakeEventSource.instances = [];
     vi.stubGlobal('EventSource', FakeEventSource);
     listJobs.mockReset();
+    // connectJobStream always fetches an initial snapshot immediately, so
+    // every test needs a working default even if it isn't asserting on it.
+    listJobs.mockResolvedValue([]);
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it('fetches a fresh snapshot via listJobs and calls onResync when the connection opens', async () => {
+  it('fetches a fresh snapshot via listJobs immediately, without waiting for the connection to open', async () => {
+    // The initial load must not depend on EventSource's `open` event firing —
+    // some browsers won't fire it promptly (or possibly at all) on a stream
+    // that hasn't sent any bytes yet, which happens whenever nothing is
+    // currently active server-side.
     const jobs = [{ id: 1, status: 'RIPPING' }];
     listJobs.mockResolvedValue(jobs);
     const onResync = vi.fn();
     connectJobStream({ onResync });
 
-    FakeEventSource.instances[0].dispatch('open');
     await vi.waitFor(() => expect(onResync).toHaveBeenCalledWith(jobs));
-
-    expect(listJobs).toHaveBeenCalledOnce();
   });
 
-  it('resyncs again on reconnect (native EventSource fires open on every reconnect)', async () => {
+  it('resyncs again when the connection opens, and again on every reconnect', async () => {
     const onResync = vi.fn();
-    listJobs.mockResolvedValueOnce([{ id: 1, status: 'RIPPING' }]);
+    listJobs.mockResolvedValueOnce([{ id: 1, status: 'DETECTED' }]);
     connectJobStream({ onResync });
-
-    FakeEventSource.instances[0].dispatch('open');
     await vi.waitFor(() => expect(onResync).toHaveBeenCalledTimes(1));
 
-    listJobs.mockResolvedValueOnce([{ id: 1, status: 'TRANSCODING' }]);
+    listJobs.mockResolvedValueOnce([{ id: 1, status: 'RIPPING' }]);
     FakeEventSource.instances[0].dispatch('open');
     await vi.waitFor(() => expect(onResync).toHaveBeenCalledTimes(2));
 
-    expect(onResync).toHaveBeenNthCalledWith(1, [{ id: 1, status: 'RIPPING' }]);
-    expect(onResync).toHaveBeenNthCalledWith(2, [{ id: 1, status: 'TRANSCODING' }]);
+    listJobs.mockResolvedValueOnce([{ id: 1, status: 'TRANSCODING' }]);
+    FakeEventSource.instances[0].dispatch('open');
+    await vi.waitFor(() => expect(onResync).toHaveBeenCalledTimes(3));
+
+    expect(onResync).toHaveBeenNthCalledWith(1, [{ id: 1, status: 'DETECTED' }]);
+    expect(onResync).toHaveBeenNthCalledWith(2, [{ id: 1, status: 'RIPPING' }]);
+    expect(onResync).toHaveBeenNthCalledWith(3, [{ id: 1, status: 'TRANSCODING' }]);
   });
 
   it('opens an EventSource against /api/jobs/stream', () => {
