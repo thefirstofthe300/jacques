@@ -219,6 +219,117 @@ async def test_identify_by_hash_missing_titles_in_disc_degrades_to_empty_titles(
 
 
 @pytest.mark.asyncio
+async def test_identify_by_hash_filters_titles_to_matching_disc_content_hash():
+    """Two releases, each with a disc sharing the same sourceFile value but
+    different episode data. Only the disc whose contentHash matches the
+    requested hash should contribute titles — not a conflated mix."""
+    svc = DiscDBService()
+
+    payload = {
+        "data": {
+            "mediaItems": [
+                {
+                    "title": "Breaking Bad",
+                    "year": 2008,
+                    "type": "Series",
+                    "externalIds": {"tmdb": 1396, "imdb": "tt0903747", "tvdb": 81189},
+                    "releases": [
+                        {
+                            "discs": [
+                                {
+                                    "contentHash": "disc-1-hash",
+                                    "index": 0,
+                                    "name": "Disc 1",
+                                    "format": "BLURAY",
+                                    "slug": "breaking-bad-s1d1",
+                                    "titles": [
+                                        {
+                                            "index": 0,
+                                            "sourceFile": "00800.mpls",
+                                            "duration": 2820,
+                                            "displaySize": "0:47:00",
+                                            "size": 123456789,
+                                            "segmentMap": "1",
+                                            "hasItem": True,
+                                            "item": {
+                                                "title": "Pilot",
+                                                "type": "Episode",
+                                                "season": 1,
+                                                "episode": 1,
+                                            },
+                                        },
+                                    ],
+                                }
+                            ]
+                        },
+                        {
+                            "discs": [
+                                {
+                                    "contentHash": "disc-2-hash",
+                                    "index": 0,
+                                    "name": "Disc 2",
+                                    "format": "BLURAY",
+                                    "slug": "breaking-bad-s1d2",
+                                    "titles": [
+                                        {
+                                            "index": 0,
+                                            "sourceFile": "00800.mpls",
+                                            "duration": 2760,
+                                            "displaySize": "0:46:00",
+                                            "size": 123456000,
+                                            "segmentMap": "1",
+                                            "hasItem": True,
+                                            "item": {
+                                                "title": "Cat's in the Bag...",
+                                                "type": "Episode",
+                                                "season": 1,
+                                                "episode": 2,
+                                            },
+                                        },
+                                    ],
+                                }
+                            ]
+                        },
+                    ],
+                }
+            ]
+        }
+    }
+
+    with respx.mock:
+        respx.post(_BASE).mock(return_value=httpx.Response(200, json=payload))
+        result = await svc.identify_by_hash("disc-2-hash")
+
+    assert isinstance(result, DiscMatch)
+    # Only disc-2's title(s) should be present, despite disc-1 having a title
+    # with the same sourceFile.
+    assert len(result.titles) == 1
+
+    title = result.titles[0]
+    assert title.source_file == "00800.mpls"
+    assert title.title == "Cat's in the Bag..."
+    assert title.season == 1
+    assert title.episode == 2
+
+
+@pytest.mark.asyncio
+async def test_identify_by_hash_returns_none_when_response_too_large():
+    svc = DiscDBService()
+
+    with respx.mock:
+        respx.post(_BASE).mock(
+            return_value=httpx.Response(
+                200,
+                json={"data": {"mediaItems": []}},
+                headers={"content-length": str(6 * 1024 * 1024)},
+            )
+        )
+        result = await svc.identify_by_hash("somehash")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_identify_by_hash_unparseable_shape_returns_none():
     """A shape so unexpected that parsing raises (not just missing keys) must
     still degrade to None via the defensive catch-all, never propagate."""
