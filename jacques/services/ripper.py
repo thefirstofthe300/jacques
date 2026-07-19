@@ -14,6 +14,7 @@ _ATTR_DURATION = 9
 _ATTR_CHAPTERS = 8
 _ATTR_FILENAME = 27
 _ATTR_SIZE = 11  # expected output file size in bytes
+_ATTR_SOURCE_FILE = 16  # BDMV playlist/stream filename on the original disc (e.g. "00800.mpls")
 
 
 @dataclass
@@ -24,6 +25,7 @@ class TitleInfo:
     filename: str
     chapter_count: int = 0
     expected_bytes: int = 0
+    source_file: str = ""
 
     @property
     def is_main_feature_hint(self) -> bool:
@@ -100,6 +102,7 @@ class Ripper:
                 filename=attrs.get(_ATTR_FILENAME, f"title_t{title_id:02d}.mkv"),
                 chapter_count=int(attrs.get(_ATTR_CHAPTERS, "0") or "0"),
                 expected_bytes=int(attrs.get(_ATTR_SIZE, "0") or "0"),
+                source_file=attrs.get(_ATTR_SOURCE_FILE, ""),
             ))
 
         log.debug("Found %d valid title(s) on %s", len(titles), self._drive_path)

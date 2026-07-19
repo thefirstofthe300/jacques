@@ -175,6 +175,55 @@ async def test_get_disc_info_ignores_non_tinfo_lines():
 
     assert len(titles) == 1
 
+@pytest.mark.asyncio
+async def test_get_disc_info_parses_source_file():
+    lines = [
+        b'TINFO:0,2,0,"Feature Film"\n',
+        b'TINFO:0,9,0,"1:45:00"\n',
+        b'TINFO:0,16,0,"00800.mpls"\n',
+    ]
+    mock_proc = MagicMock()
+    mock_proc.stdout = _async_lines(lines)
+    mock_proc.wait = AsyncMock(return_value=0)
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+        titles = await Ripper("/dev/sr0", min_duration_seconds=1200).get_disc_info()
+
+    assert len(titles) == 1
+    assert titles[0].source_file == "00800.mpls"
+
+
+@pytest.mark.asyncio
+async def test_get_disc_info_defaults_source_file_when_missing():
+    lines = [
+        b'TINFO:0,2,0,"Feature Film"\n',
+        b'TINFO:0,9,0,"1:45:00"\n',
+    ]
+    mock_proc = MagicMock()
+    mock_proc.stdout = _async_lines(lines)
+    mock_proc.wait = AsyncMock(return_value=0)
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+        titles = await Ripper("/dev/sr0", min_duration_seconds=1200).get_disc_info()
+
+    assert len(titles) == 1
+    assert titles[0].source_file == ""
+
+
+def test_title_info_deserializes_without_source_file():
+    old_dict = {
+        "id": 0,
+        "name": "Feature Film",
+        "duration_seconds": 6300,
+        "filename": "title_t00.mkv",
+        "chapter_count": 24,
+        "expected_bytes": 1000000000,
+    }
+
+    title = TitleInfo(**old_dict)
+
+    assert title.source_file == ""
+
 
 # ── rip tests ─────────────────────────────────────────────────────────────────
 
