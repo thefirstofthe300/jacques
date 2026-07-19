@@ -188,6 +188,7 @@
           python.pkgs.pyudev
           python.pkgs.httpx
           python.pkgs.rich
+          python.pkgs.pycdlib
           wordsegment
         ];
 
