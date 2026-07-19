@@ -17,6 +17,8 @@ from .models.job import DiscType, Job, JobStatus
 from .models.ripped_disc import RippedDisc
 from .services.broadcaster import Broadcaster
 from .services.detector import DiscDetector
+from .services.discdb import DiscDBService, DiscMatch, DiscDBTitle, TYPE_MAP
+from .services.dischash import compute_content_hash
 from .services.metadata import MediaInfo, MetadataService
 from .services.organizer import Organizer
 from .services.ripper import Ripper, TitleInfo
@@ -51,19 +53,44 @@ def _stage_progress(job_id: int, stage_index: int, stage_count: int):
 
 
 async def _fetch_metadata(
-    job_id: int, disc_label: str | None, disc_type_hint: DiscType, metadata_svc: MetadataService
+    job_id: int,
+    disc_label: str | None,
+    disc_type_hint: DiscType,
+    metadata_svc: MetadataService,
+    disc_match: DiscMatch | None,
 ) -> MediaInfo | None:
-    """Fetch TMDb metadata. Runs concurrently with ripping — does not touch job.status
-    except to flag RIPPING_AWAITING_SELECTION when the match is ambiguous or when TMDb
-    found no match at all (both need the user to pick or enter a TMDb ID manually),
-    since the rip side owns job.status otherwise during this window (see comment in
+    """Fetch metadata, using an already-resolved TheDiscDB match before falling back
+    to TMDb. Runs concurrently with ripping — does not touch job.status except to flag
+    RIPPING_AWAITING_SELECTION when the TMDb match is ambiguous or when TMDb found no
+    match at all (both need the user to pick or enter a TMDb ID manually), since the
+    rip side owns job.status otherwise during this window (see comment in
     _run_pipeline).
+
+    `disc_match` is computed once (in the IDENTIFYING stage, or recomputed on a resume
+    that skips straight to FETCHING_METADATA) and threaded in here rather than looked
+    up again, so the same match also used to drive title correlation always agrees with
+    the metadata stored on the job — no second GraphQL round-trip, and no risk of the
+    two calls disagreeing. A resolved match is always treated as unambiguous (its schema
+    never yields multiple candidates the way a TMDb text search does), so it never
+    routes through the candidates/AWAITING_SELECTION path below.
 
     Returns the resolved MediaInfo if unambiguous, or None if ambiguous or no match was
     found — both cases store an empty or populated candidates list on the job for user
     selection/manual entry.
     """
     log.info("Job %d: fetching metadata for %r", job_id, disc_label)
+
+    if disc_match is not None:
+        media_info = disc_match.media_info
+        await _update_job(
+            job_id,
+            title=media_info.title,
+            year=media_info.year,
+            disc_type=media_info.disc_type,
+            tmdb_id=media_info.tmdb_id,
+        )
+        return media_info
+
     media_info = await metadata_svc.identify(disc_label or "", disc_type_hint)
     if isinstance(media_info, list):
         candidates_json = json.dumps([
@@ -179,6 +206,35 @@ def _titles_to_rip(ripper: Ripper, disc_type_hint: DiscType, titles: list[TitleI
     return titles
 
 
+def _join_discdb_titles(
+    titles: list[TitleInfo], disc_match: DiscMatch | None
+) -> list[tuple[TitleInfo, DiscDBTitle]] | None:
+    """Join MakeMKV titles to TheDiscDB's per-title map by source_file, all-or-nothing.
+
+    Returns None (signalling "untrustworthy, fall back to the heuristic") when: there's
+    no disc_match at all; any title fails to join (including a title with no
+    source_file, e.g. MakeMKV didn't emit TINFO attribute 16); or the has_item-filtered
+    result would be empty. Otherwise returns the (title, disc_title) pairs whose
+    DiscDBTitle has has_item == True, in original order.
+    """
+    if disc_match is None:
+        return None
+
+    by_source_file: dict[str, DiscDBTitle] = {
+        d.source_file: d for d in disc_match.titles if d.source_file
+    }
+
+    joined: list[tuple[TitleInfo, DiscDBTitle]] = []
+    for title in titles:
+        disc_title = by_source_file.get(title.source_file) if title.source_file else None
+        if disc_title is None:
+            return None
+        joined.append((title, disc_title))
+
+    selected = [pair for pair in joined if pair[1].has_item]
+    return selected or None
+
+
 async def _run_pipeline(
     job_id: int,
     drive_path: str,
@@ -193,11 +249,14 @@ async def _run_pipeline(
     ripper = Ripper(drive_path, settings.min_title_duration_seconds, settings.makemkvcon_path)
     transcoder = Transcoder(quality=settings.handbrake_quality, handbrake_path=settings.handbrake_path, preset=settings.handbrake_preset)
     metadata_svc = MetadataService(settings.tmdb_api_key)
+    discdb_svc = DiscDBService(settings.discdb_base_url)
     organizer = Organizer(settings.output_path)
 
     disc_type_hint: DiscType = DiscType.UNKNOWN
     titles_to_rip: list = []
     media_info: MediaInfo | None = None
+    content_hash: str | None = None
+    disc_match: DiscMatch | None = None
     raw_paths: list[Path] = []
     transcoded_paths: list[Path] = []
     resume_raw: list[Path] = []
@@ -216,6 +275,13 @@ async def _run_pipeline(
                     titles_to_rip = _titles_to_rip(ripper, disc_type_hint, all_titles)
                 if not _should_run(JobStatus.FETCHING_METADATA, start_stage) and job.title:
                     media_info = _media_info_from_job(job)
+        # A resume that skips IDENTIFYING but still needs to run FETCHING_METADATA
+        # (e.g. a rerun starting exactly at FETCHING_METADATA) never gets a
+        # content_hash/disc_match from the IDENTIFYING block below, since that block
+        # is skipped — recompute both here so DiscDB is still tried on this path.
+        if _should_run(JobStatus.FETCHING_METADATA, start_stage):
+            content_hash = await asyncio.to_thread(compute_content_hash, drive_path)
+            disc_match = await discdb_svc.identify_by_hash(content_hash) if content_hash else None
 
     if not _should_run(JobStatus.RIPPING, start_stage):
         raw_paths = sorted(raw_dir.glob("*/*.mkv"), key=lambda p: int(p.parent.name)) if (raw_dir.exists() and (raw_dir / ".done").exists()) else []
@@ -229,6 +295,9 @@ async def _run_pipeline(
             await _update_job(job_id, status=JobStatus.IDENTIFYING, progress=0)
             log.info("Job %d: identifying disc %s", job_id, drive_path)
 
+            content_hash = await asyncio.to_thread(compute_content_hash, drive_path)
+            disc_match = await discdb_svc.identify_by_hash(content_hash) if content_hash else None
+
             titles = await ripper.get_disc_info()
             if not titles:
                 raise RuntimeError(
@@ -236,18 +305,41 @@ async def _run_pipeline(
                 )
 
             disc_type_hint = DiscType.TV_SHOW if ripper.is_tv_show_hint(titles) else DiscType.MOVIE
-            await _update_job(
-                job_id,
-                disc_type=disc_type_hint,
-                titles_json=json.dumps([dataclasses.asdict(t) for t in titles]),
+
+            joined_discdb_titles = _join_discdb_titles(titles, disc_match)
+            titles_to_rip = (
+                [t for t, _ in joined_discdb_titles]
+                if joined_discdb_titles is not None
+                else _titles_to_rip(ripper, disc_type_hint, titles)
             )
 
-            titles_to_rip = _titles_to_rip(ripper, disc_type_hint, titles)
+            job_updates: dict[str, object] = {
+                "disc_type": disc_type_hint,
+                "titles_json": json.dumps([dataclasses.asdict(t) for t in titles]),
+            }
+
+            # When DiscDB's title data drove the rip selection, pre-fill
+            # episode_assignments/selected_title_id so the AWAITING_EPISODE_ASSIGNMENT/
+            # AWAITING_TITLE_SELECTION pause-point checks below (unchanged) find the
+            # decision already made and skip the pause.
+            if joined_discdb_titles is not None:
+                if all(d.season is not None and d.episode is not None for _, d in joined_discdb_titles):
+                    job_updates["episode_assignments"] = json.dumps({
+                        str(t.id): {"season": d.season, "episode": d.episode, "name": d.title}
+                        for t, d in joined_discdb_titles
+                    })
+
+                if len(joined_discdb_titles) > 1:
+                    movie_matches = [t for t, d in joined_discdb_titles if TYPE_MAP.get(d.type) == DiscType.MOVIE]
+                    if len(movie_matches) == 1:
+                        job_updates["selected_title_id"] = movie_matches[0].id
+
+            await _update_job(job_id, **job_updates)
 
         # ── FETCHING METADATA (runs concurrently with ripping, see below) ───────
         if _should_run(JobStatus.FETCHING_METADATA, start_stage):
             metadata_task = asyncio.create_task(
-                _fetch_metadata(job_id, disc_label, disc_type_hint, metadata_svc),
+                _fetch_metadata(job_id, disc_label, disc_type_hint, metadata_svc, disc_match),
                 name=f"metadata-{job_id}",
             )
 

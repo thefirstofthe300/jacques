@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     handbrake_preset: str = "medium"
 
     tmdb_api_key: str = ""
+    discdb_base_url: str = "https://thediscdb.com/graphql"
 
     host: str = "0.0.0.0"
     port: int = 8080
