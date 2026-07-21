@@ -10,39 +10,46 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_BASE_URL = "https://thediscdb.com/graphql"
 
-# TheDiscDB has no official schema docs; this query shape is reverse-engineered
-# from the site's own client and third-party clients.
+# TheDiscDB has no official schema docs; this query shape was built from live
+# GraphQL introspection against thediscdb.com/graphql (its own client and
+# third-party clients reverse-engineer it the same way -- there's no other
+# source of truth). `mediaItems` is the only paginated field in this query
+# (hence `nodes`); the nested `releases`/`discs`/`titles` are plain lists.
+# `contentHash` matching is case-insensitive server-side, so the hash is
+# passed through as-is (Python's `hexdigest()` is already lowercase).
 _QUERY = """
 query LookupByHash($hash: String!) {
-  mediaItems(discHash: $hash) {
-    title
-    year
-    type
-    externalIds {
-      tmdb
-      imdb
-      tvdb
-    }
-    releases {
-      discs {
-        contentHash
-        index
-        name
-        format
-        slug
-        titles {
+  mediaItems(where: { releases: { some: { discs: { some: { contentHash: { eq: $hash } } } } } }) {
+    nodes {
+      title
+      year
+      type
+      externalids {
+        tmdb
+        imdb
+        tvdb
+      }
+      releases {
+        discs {
+          contentHash
           index
-          sourceFile
-          duration
-          displaySize
-          size
-          segmentMap
-          hasItem
-          item {
-            title
-            type
-            season
-            episode
+          name
+          format
+          slug
+          titles {
+            index
+            sourceFile
+            duration
+            displaySize
+            size
+            segmentMap
+            hasItem
+            item {
+              title
+              type
+              season
+              episode
+            }
           }
         }
       }
@@ -63,6 +70,16 @@ TYPE_MAP = {
 # anything past this is either a misconfigured discdb_base_url or a
 # compromised/misbehaving upstream, so refuse to buffer it.
 _MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+
+
+def _parse_int(value: str | None) -> int | None:
+    """TheDiscDB's schema types tmdb/season/episode as `String`, not `Int`."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -140,7 +157,7 @@ class DiscDBService:
             log.warning("TheDiscDB returned GraphQL errors: %s", errors)
             return None
 
-        media_items = (payload.get("data") or {}).get("mediaItems") or []
+        media_items = ((payload.get("data") or {}).get("mediaItems") or {}).get("nodes") or []
         if not media_items:
             log.warning("No TheDiscDB match found for content hash %r", content_hash)
             return None
@@ -158,8 +175,8 @@ class DiscDBService:
         raw_type = item.get("type") or ""
         disc_type = TYPE_MAP.get(raw_type, DiscType.UNKNOWN)
 
-        external_ids = item.get("externalIds") or {}
-        tmdb_id = external_ids.get("tmdb")
+        external_ids = item.get("externalids") or {}
+        tmdb_id = _parse_int(external_ids.get("tmdb"))
 
         media_info = MediaInfo(
             title=item.get("title") or "",
@@ -175,13 +192,16 @@ class DiscDBService:
         # sourceFile value across discs, so titles must only be pulled from
         # the disc(s) that actually match the hash that was looked up —
         # otherwise a caller joining by source_file alone can silently pick
-        # up another disc's episode/movie data.
+        # up another disc's episode/movie data. TheDiscDB compares hashes
+        # case-insensitively (confirmed against its live API), so this
+        # comparison must too, or a correct server-side match would fail to
+        # line up with any disc here and spuriously fall back to all discs.
         all_discs: list[dict] = []
         matched_discs: list[dict] = []
         for release in item.get("releases") or []:
             for disc in release.get("discs") or []:
                 all_discs.append(disc)
-                if disc.get("contentHash") == content_hash:
+                if (disc.get("contentHash") or "").lower() == content_hash.lower():
                     matched_discs.append(disc)
 
         if matched_discs:
@@ -208,8 +228,8 @@ class DiscDBService:
                         has_item=bool(disc_title.get("hasItem")),
                         title=disc_item.get("title") or "",
                         type=disc_item.get("type") or "",
-                        season=disc_item.get("season"),
-                        episode=disc_item.get("episode"),
+                        season=_parse_int(disc_item.get("season")),
+                        episode=_parse_int(disc_item.get("episode")),
                     )
                 )
 

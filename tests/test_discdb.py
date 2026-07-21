@@ -8,76 +8,78 @@ from jacques.services.discdb import DiscDBService, DiscMatch
 _BASE = "https://thediscdb.com/graphql"
 
 
+def _connection(*nodes: dict) -> dict:
+    """Wrap media items in the `mediaItems { nodes {...} }` connection shape
+    TheDiscDB's live schema actually returns (confirmed via introspection)."""
+    return {"data": {"mediaItems": {"nodes": list(nodes)}}}
+
+
 @pytest.mark.asyncio
 async def test_identify_by_hash_success():
     svc = DiscDBService()
 
-    payload = {
-        "data": {
-            "mediaItems": [
+    payload = _connection(
+        {
+            "title": "Breaking Bad",
+            "year": 2008,
+            "type": "Series",
+            "externalids": {"tmdb": "1396", "imdb": "tt0903747", "tvdb": "81189"},
+            "releases": [
                 {
-                    "title": "Breaking Bad",
-                    "year": 2008,
-                    "type": "Series",
-                    "externalIds": {"tmdb": 1396, "imdb": "tt0903747", "tvdb": 81189},
-                    "releases": [
+                    "discs": [
                         {
-                            "discs": [
+                            "contentHash": "abc123",
+                            "index": 0,
+                            "name": "Disc 1",
+                            "format": "BLURAY",
+                            "slug": "breaking-bad-s1d1",
+                            "titles": [
                                 {
-                                    "contentHash": "abc123",
                                     "index": 0,
-                                    "name": "Disc 1",
-                                    "format": "BLURAY",
-                                    "slug": "breaking-bad-s1d1",
-                                    "titles": [
-                                        {
-                                            "index": 0,
-                                            "sourceFile": "00001.mpls",
-                                            "duration": 2820,
-                                            "displaySize": "0:47:00",
-                                            "size": 123456789,
-                                            "segmentMap": "1",
-                                            "hasItem": True,
-                                            "item": {
-                                                "title": "Pilot",
-                                                "type": "Episode",
-                                                "season": 1,
-                                                "episode": 1,
-                                            },
-                                        },
-                                        {
-                                            "index": 1,
-                                            "sourceFile": "00002.mpls",
-                                            "duration": 2760,
-                                            "displaySize": "0:46:00",
-                                            "size": 123456000,
-                                            "segmentMap": "2",
-                                            "hasItem": True,
-                                            "item": {
-                                                "title": "Cat's in the Bag...",
-                                                "type": "Episode",
-                                                "season": 1,
-                                                "episode": 2,
-                                            },
-                                        },
-                                        {
-                                            "index": 2,
-                                            "sourceFile": "00003.mpls",
-                                            "duration": 120,
-                                            "displaySize": "0:02:00",
-                                            "size": 1000,
-                                            "segmentMap": "3",
-                                            "hasItem": False,
-                                        },
-                                    ],
-                                }
-                            ]
+                                    "sourceFile": "00001.mpls",
+                                    "duration": "0:47:00",
+                                    "displaySize": "0:47:00",
+                                    "size": 123456789,
+                                    "segmentMap": "1",
+                                    "hasItem": True,
+                                    "item": {
+                                        "title": "Pilot",
+                                        "type": "Episode",
+                                        "season": "1",
+                                        "episode": "1",
+                                    },
+                                },
+                                {
+                                    "index": 1,
+                                    "sourceFile": "00002.mpls",
+                                    "duration": "0:46:00",
+                                    "displaySize": "0:46:00",
+                                    "size": 123456000,
+                                    "segmentMap": "2",
+                                    "hasItem": True,
+                                    "item": {
+                                        "title": "Cat's in the Bag...",
+                                        "type": "Episode",
+                                        "season": "1",
+                                        "episode": "2",
+                                    },
+                                },
+                                {
+                                    "index": 2,
+                                    "sourceFile": "00003.mpls",
+                                    "duration": "0:02:00",
+                                    "displaySize": "0:02:00",
+                                    "size": 1000,
+                                    "segmentMap": "3",
+                                    "hasItem": False,
+                                },
+                            ],
                         }
-                    ],
+                    ]
                 }
-            ]
+            ],
         }
-    }
+    )
 
     with respx.mock:
         respx.post(_BASE).mock(return_value=httpx.Response(200, json=payload))
@@ -120,9 +122,7 @@ async def test_identify_by_hash_no_match():
     svc = DiscDBService()
 
     with respx.mock:
-        respx.post(_BASE).mock(
-            return_value=httpx.Response(200, json={"data": {"mediaItems": []}})
-        )
+        respx.post(_BASE).mock(return_value=httpx.Response(200, json=_connection()))
         result = await svc.identify_by_hash("unknownhash")
 
     assert result is None
@@ -155,19 +155,15 @@ async def test_identify_by_hash_returns_none_on_network_error():
 async def test_identify_by_hash_missing_releases_degrades_to_empty_titles():
     svc = DiscDBService()
 
-    payload = {
-        "data": {
-            "mediaItems": [
-                {
-                    "title": "Some Movie",
-                    "year": 2020,
-                    "type": "Movie",
-                    "externalIds": {"tmdb": 42},
-                    # "releases" is entirely absent
-                }
-            ]
+    payload = _connection(
+        {
+            "title": "Some Movie",
+            "year": 2020,
+            "type": "Movie",
+            "externalids": {"tmdb": "42"},
+            # "releases" is entirely absent
         }
-    }
+    )
 
     with respx.mock:
         respx.post(_BASE).mock(return_value=httpx.Response(200, json=payload))
@@ -183,32 +179,28 @@ async def test_identify_by_hash_missing_releases_degrades_to_empty_titles():
 async def test_identify_by_hash_missing_titles_in_disc_degrades_to_empty_titles():
     svc = DiscDBService()
 
-    payload = {
-        "data": {
-            "mediaItems": [
+    payload = _connection(
+        {
+            "title": "Some Movie",
+            "year": 2020,
+            "type": "Movie",
+            "externalids": {"tmdb": "42"},
+            "releases": [
                 {
-                    "title": "Some Movie",
-                    "year": 2020,
-                    "type": "Movie",
-                    "externalIds": {"tmdb": 42},
-                    "releases": [
+                    "discs": [
                         {
-                            "discs": [
-                                {
-                                    "contentHash": "abc123",
-                                    "index": 0,
-                                    "name": "Disc 1",
-                                    "format": "BLURAY",
-                                    "slug": "some-movie",
-                                    # "titles" is entirely absent
-                                }
-                            ]
+                            "contentHash": "abc123",
+                            "index": 0,
+                            "name": "Disc 1",
+                            "format": "BLURAY",
+                            "slug": "some-movie",
+                            # "titles" is entirely absent
                         }
-                    ],
+                    ]
                 }
-            ]
+            ],
         }
-    }
+    )
 
     with respx.mock:
         respx.post(_BASE).mock(return_value=httpx.Response(200, json=payload))
@@ -225,76 +217,72 @@ async def test_identify_by_hash_filters_titles_to_matching_disc_content_hash():
     requested hash should contribute titles — not a conflated mix."""
     svc = DiscDBService()
 
-    payload = {
-        "data": {
-            "mediaItems": [
+    payload = _connection(
+        {
+            "title": "Breaking Bad",
+            "year": 2008,
+            "type": "Series",
+            "externalids": {"tmdb": "1396", "imdb": "tt0903747", "tvdb": "81189"},
+            "releases": [
                 {
-                    "title": "Breaking Bad",
-                    "year": 2008,
-                    "type": "Series",
-                    "externalIds": {"tmdb": 1396, "imdb": "tt0903747", "tvdb": 81189},
-                    "releases": [
+                    "discs": [
                         {
-                            "discs": [
+                            "contentHash": "disc-1-hash",
+                            "index": 0,
+                            "name": "Disc 1",
+                            "format": "BLURAY",
+                            "slug": "breaking-bad-s1d1",
+                            "titles": [
                                 {
-                                    "contentHash": "disc-1-hash",
                                     "index": 0,
-                                    "name": "Disc 1",
-                                    "format": "BLURAY",
-                                    "slug": "breaking-bad-s1d1",
-                                    "titles": [
-                                        {
-                                            "index": 0,
-                                            "sourceFile": "00800.mpls",
-                                            "duration": 2820,
-                                            "displaySize": "0:47:00",
-                                            "size": 123456789,
-                                            "segmentMap": "1",
-                                            "hasItem": True,
-                                            "item": {
-                                                "title": "Pilot",
-                                                "type": "Episode",
-                                                "season": 1,
-                                                "episode": 1,
-                                            },
-                                        },
-                                    ],
-                                }
-                            ]
-                        },
+                                    "sourceFile": "00800.mpls",
+                                    "duration": "0:47:00",
+                                    "displaySize": "0:47:00",
+                                    "size": 123456789,
+                                    "segmentMap": "1",
+                                    "hasItem": True,
+                                    "item": {
+                                        "title": "Pilot",
+                                        "type": "Episode",
+                                        "season": "1",
+                                        "episode": "1",
+                                    },
+                                },
+                            ],
+                        }
+                    ]
+                },
+                {
+                    "discs": [
                         {
-                            "discs": [
+                            "contentHash": "disc-2-hash",
+                            "index": 0,
+                            "name": "Disc 2",
+                            "format": "BLURAY",
+                            "slug": "breaking-bad-s1d2",
+                            "titles": [
                                 {
-                                    "contentHash": "disc-2-hash",
                                     "index": 0,
-                                    "name": "Disc 2",
-                                    "format": "BLURAY",
-                                    "slug": "breaking-bad-s1d2",
-                                    "titles": [
-                                        {
-                                            "index": 0,
-                                            "sourceFile": "00800.mpls",
-                                            "duration": 2760,
-                                            "displaySize": "0:46:00",
-                                            "size": 123456000,
-                                            "segmentMap": "1",
-                                            "hasItem": True,
-                                            "item": {
-                                                "title": "Cat's in the Bag...",
-                                                "type": "Episode",
-                                                "season": 1,
-                                                "episode": 2,
-                                            },
-                                        },
-                                    ],
-                                }
-                            ]
-                        },
-                    ],
-                }
-            ]
+                                    "sourceFile": "00800.mpls",
+                                    "duration": "0:46:00",
+                                    "displaySize": "0:46:00",
+                                    "size": 123456000,
+                                    "segmentMap": "1",
+                                    "hasItem": True,
+                                    "item": {
+                                        "title": "Cat's in the Bag...",
+                                        "type": "Episode",
+                                        "season": "1",
+                                        "episode": "2",
+                                    },
+                                },
+                            ],
+                        }
+                    ]
+                },
+            ],
         }
-    }
+    )
 
     with respx.mock:
         respx.post(_BASE).mock(return_value=httpx.Response(200, json=payload))
@@ -313,6 +301,61 @@ async def test_identify_by_hash_filters_titles_to_matching_disc_content_hash():
 
 
 @pytest.mark.asyncio
+async def test_identify_by_hash_matches_content_hash_case_insensitively():
+    """TheDiscDB's own contentHash comparison is case-insensitive (confirmed
+    against its live API), and Python's `hexdigest()` is always lowercase —
+    so a disc's stored (commonly uppercase) hash must still match here."""
+    svc = DiscDBService()
+
+    payload = _connection(
+        {
+            "title": "'Round Midnight",
+            "year": 1986,
+            "type": "Movie",
+            "externalids": {"tmdb": "14670"},
+            "releases": [
+                {
+                    "discs": [
+                        {
+                            "contentHash": "2D61282D8DA5EAC2CA87B451BCE9A055",
+                            "index": 0,
+                            "name": "Disc 1",
+                            "format": "BLURAY",
+                            "slug": "round-midnight",
+                            "titles": [
+                                {
+                                    "index": 0,
+                                    "sourceFile": "00001.mpls",
+                                    "duration": "2:11:34",
+                                    "displaySize": "33.8 GB",
+                                    "size": 36380633088,
+                                    "segmentMap": "274",
+                                    "hasItem": True,
+                                    "item": {
+                                        "title": "'Round Midnight",
+                                        "type": "MainMovie",
+                                        "season": None,
+                                        "episode": None,
+                                    },
+                                },
+                            ],
+                        }
+                    ]
+                }
+            ],
+        }
+    )
+
+    with respx.mock:
+        respx.post(_BASE).mock(return_value=httpx.Response(200, json=payload))
+        result = await svc.identify_by_hash("2d61282d8da5eac2ca87b451bce9a055")
+
+    assert isinstance(result, DiscMatch)
+    assert len(result.titles) == 1
+    assert result.titles[0].title == "'Round Midnight"
+
+
+@pytest.mark.asyncio
 async def test_identify_by_hash_returns_none_when_response_too_large():
     svc = DiscDBService()
 
@@ -320,7 +363,7 @@ async def test_identify_by_hash_returns_none_when_response_too_large():
         respx.post(_BASE).mock(
             return_value=httpx.Response(
                 200,
-                json={"data": {"mediaItems": []}},
+                json=_connection(),
                 headers={"content-length": str(6 * 1024 * 1024)},
             )
         )
@@ -335,22 +378,18 @@ async def test_identify_by_hash_unparseable_shape_returns_none():
     still degrade to None via the defensive catch-all, never propagate."""
     svc = DiscDBService()
 
-    payload = {
-        "data": {
-            "mediaItems": [
-                {
-                    "title": "Some Movie",
-                    "year": 2020,
-                    "type": "Movie",
-                    "externalIds": {"tmdb": 42},
-                    # `discs` is a string rather than a list of dicts, so
-                    # iterating it yields characters with no `.get` method,
-                    # raising AttributeError inside _parse_media_item.
-                    "releases": [{"discs": "not-a-list"}],
-                }
-            ]
+    payload = _connection(
+        {
+            "title": "Some Movie",
+            "year": 2020,
+            "type": "Movie",
+            "externalids": {"tmdb": "42"},
+            # `discs` is a string rather than a list of dicts, so
+            # iterating it yields characters with no `.get` method,
+            # raising AttributeError inside _parse_media_item.
+            "releases": [{"discs": "not-a-list"}],
         }
-    }
+    )
 
     with respx.mock:
         respx.post(_BASE).mock(return_value=httpx.Response(200, json=payload))
