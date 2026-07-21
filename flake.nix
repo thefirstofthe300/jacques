@@ -192,6 +192,21 @@
           wordsegment
         ];
 
+        # `nix build .`/`nix run .` resolve `./.` through the flake's own git
+        # metadata, so it's automatically .gitignore-filtered. An *external*
+        # flake referencing this one via a `path:` input (e.g. a home-manager
+        # config) does not get that treatment -- it copies everything on
+        # disk, including gitignored cruft like `build/`, `dist/`, `.venv/`,
+        # stray git worktrees, etc. That once caused a stale, pre-Svelte
+        # copy of the whole app to get bundled instead of the real source.
+        # This filter makes both derivations below robust to that regardless
+        # of what happens to be lying around in the checkout.
+        jacquesSourceFilter = path: type:
+          !(builtins.elem (baseNameOf path) [
+            ".git" ".claude" ".venv" "build" "dist" "result"
+            "__pycache__" "node_modules" ".pytest_cache"
+          ]);
+
         # Svelte + Vite SPA that replaced the old Jinja2/HTMX dashboard.
         # `jacques/api/app.py` serves it from a `static/` directory sibling to
         # the installed package's Python files, so it has to be built and
@@ -229,6 +244,7 @@
           src = builtins.path {
             path = ./.;
             name = "jacques-source";
+            filter = jacquesSourceFilter;
           };
           sourceRoot = "jacques-source/frontend";
 
@@ -257,7 +273,11 @@
           pname = "jacques";
           version = "0.1.0";
           pyproject = true;
-          src = ./.;
+          src = builtins.path {
+            path = ./.;
+            name = "jacques-app-source";
+            filter = jacquesSourceFilter;
+          };
 
           build-system = [ python.pkgs.setuptools ];
 
@@ -273,8 +293,9 @@
           postInstall = ''
             wrapProgram $out/bin/jacques \
               --prefix PATH : ${pkgs.lib.makeBinPath [
-                pkgs.makemkv   # provides makemkvcon
-                pkgs.handbrake # provides HandBrakeCLI
+                pkgs.makemkv    # provides makemkvcon
+                pkgs.handbrake  # provides HandBrakeCLI
+                pkgs._7zz       # provides 7zz, for pure-UDF disc reads (see jacques/services/dischash.py)
               ]}
 
             rm -rf $out/${python.sitePackages}/jacques/static

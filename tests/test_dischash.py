@@ -11,8 +11,10 @@ path to `compute_content_hash` exactly as a real drive path would be used.
 import hashlib
 import io
 import struct
+import subprocess
 
 import pycdlib
+from pycdlib import pycdlibexception
 
 from jacques.services.dischash import compute_content_hash
 
@@ -168,3 +170,119 @@ def test_image_without_bdmv_or_video_ts_returns_none(tmp_path):
     _build_plain_image(str(image_path))
 
     assert compute_content_hash(str(image_path)) is None
+
+
+# ── Pure-UDF fallback (no ISO9660 PVD at all) ─────────────────────────────────
+#
+# pycdlib's own `.new()` always writes a valid ISO9660 PVD, even for `udf=`
+# images, so a "real pure-UDF" disc can't be reproduced with a genuine
+# pycdlib-authored image. These tests instead monkeypatch `PyCdlib.open` to
+# raise exactly what pycdlib raises for a real disc like this (confirmed
+# against an actual Blu-ray with no ISO9660 bridge layer), and fake the `7zz`
+# subprocess call to emit `-slt`-formatted output for the requested
+# directory, exactly as `_compute_content_hash_via_7z` would parse it from a
+# real `7zz l -slt` invocation (format also confirmed against that same real
+# disc).
+
+
+def _fake_open_pure_udf(self, filename, mode="rb"):
+    self._has_udf = True
+    raise pycdlibexception.PyCdlibInvalidISO("Valid ISO9660 filesystems must have at least one PVD")
+
+
+def _fake_open_not_a_disc(self, filename, mode="rb"):
+    raise pycdlibexception.PyCdlibInvalidISO("Failed to read entire volume descriptor")
+
+
+def _7z_slt_block(path: str, size: int) -> str:
+    """One `7zz l -slt` block for a (non-directory) file entry."""
+    return f"Path = {path}\nFolder = -\nSize = {size}\nPacked Size = {size}\n"
+
+
+def _fake_7z_listing(dir_to_files: dict[str, list[tuple[str, int]]]):
+    """Build a fake `subprocess.run` that emits `-slt`-formatted output for `7zz`."""
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "7zz":
+            requested = cmd[-1].removesuffix("/*")
+            files = dir_to_files.get(requested, [])
+            stdout = "\n".join(_7z_slt_block(f"{requested}/{name}", size) for name, size in files)
+            return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    return fake_run
+
+
+def test_pure_udf_disc_falls_back_to_7z(tmp_path, monkeypatch):
+    monkeypatch.setattr(pycdlib.PyCdlib, "open", _fake_open_pure_udf)
+    files = [("00002.m2ts", 8192), ("00001.m2ts", 4096), ("00003.m2ts", 2048)]
+    monkeypatch.setattr(
+        "jacques.services.dischash.subprocess.run",
+        _fake_7z_listing({"BDMV/STREAM": files}),
+    )
+
+    result = compute_content_hash(str(tmp_path / "disc.img"))
+
+    assert result == _expected_hash(files)
+
+
+def test_pure_udf_dvd_shaped_disc_falls_back_to_7z(tmp_path, monkeypatch):
+    monkeypatch.setattr(pycdlib.PyCdlib, "open", _fake_open_pure_udf)
+    files = [("VTS_01_1.VOB", 6144), ("VIDEO_TS.IFO", 2048)]
+    monkeypatch.setattr(
+        "jacques.services.dischash.subprocess.run",
+        _fake_7z_listing({"VIDEO_TS": files}),
+    )
+
+    result = compute_content_hash(str(tmp_path / "disc.img"))
+
+    assert result == _expected_hash(files)
+
+
+def test_pure_udf_disc_without_bdmv_or_video_ts_after_7z_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(pycdlib.PyCdlib, "open", _fake_open_pure_udf)
+    monkeypatch.setattr("jacques.services.dischash.subprocess.run", _fake_7z_listing({}))
+
+    assert compute_content_hash(str(tmp_path / "disc.img")) is None
+
+
+def test_pure_udf_disc_skips_directory_entries_via_7z(tmp_path, monkeypatch):
+    """A `Folder = +` block (a subdirectory) must never be hashed as a file."""
+    monkeypatch.setattr(pycdlib.PyCdlib, "open", _fake_open_pure_udf)
+    files = [("00001.m2ts", 4096)]
+
+    def fake_run(cmd, **kwargs):
+        stdout = (
+            "Path = BDMV/STREAM/SUBDIR\nFolder = +\nSize = 0\n\n"
+            + _7z_slt_block("BDMV/STREAM/00001.m2ts", 4096)
+        )
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("jacques.services.dischash.subprocess.run", fake_run)
+
+    result = compute_content_hash(str(tmp_path / "disc.img"))
+
+    assert result == _expected_hash(files)
+
+
+def test_non_disc_invalid_iso_does_not_attempt_7z(tmp_path, monkeypatch):
+    """A file that's just not a disc image at all must never shell out to 7zz."""
+    monkeypatch.setattr(pycdlib.PyCdlib, "open", _fake_open_not_a_disc)
+
+    def fail_if_called(cmd, **kwargs):
+        raise AssertionError(f"7zz should not be attempted for a non-disc file: {cmd}")
+
+    monkeypatch.setattr("jacques.services.dischash.subprocess.run", fail_if_called)
+
+    assert compute_content_hash(str(tmp_path / "garbage.bin")) is None
+
+
+def test_7z_failure_returns_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(pycdlib.PyCdlib, "open", _fake_open_pure_udf)
+
+    def fake_run(cmd, **kwargs):
+        raise FileNotFoundError("7zz: command not found")
+
+    monkeypatch.setattr("jacques.services.dischash.subprocess.run", fake_run)
+
+    assert compute_content_hash(str(tmp_path / "disc.img")) is None
