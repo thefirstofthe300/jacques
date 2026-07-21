@@ -35,7 +35,7 @@ async def _run_one(
     await queue.put((drive_path, disc_label, disc_uuid))
 
     with patch("jacques.daemon.AsyncSessionLocal", db_factory):
-        task = asyncio.create_task(_process_jobs(queue))
+        task = asyncio.create_task(_process_jobs(queue, set()))
         await asyncio.wait_for(queue.join(), timeout=10.0)
         task.cancel()
         try:

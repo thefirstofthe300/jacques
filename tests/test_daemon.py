@@ -8,13 +8,15 @@ pipeline/daemon test calls `_update_job` without ever setting
 `Broadcaster` + `Job.to_response_dict()`. These tests exercise that path
 directly.
 """
+import asyncio
+import logging
 from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
 
 from jacques.api.app import app
-from jacques.daemon import _update_job
+from jacques.daemon import _redact_secrets_from_log_record, _shutdown_watcher, _update_job
 from jacques.models.job import Job, JobStatus
 from jacques.services.broadcaster import Broadcaster
 
@@ -103,3 +105,99 @@ async def test_update_job_skips_publish_when_job_events_unset(db_factory):
     job = await _get_job(db_factory, job_id)
     assert job.status == JobStatus.RIPPING
     assert job.progress == 10
+
+
+# ── Secret redaction in httpx request logs ────────────────────────────────────
+
+
+def _log_record(msg, args=()):
+    return logging.LogRecord("httpx", logging.INFO, __file__, 1, msg, args, None)
+
+
+def test_redact_secrets_masks_api_key_in_rendered_message():
+    record = _log_record(
+        'HTTP Request: GET https://api.themoviedb.org/3/search/movie?api_key=b34eb5386c2b1b8a&query=Edge "HTTP/1.1 200 OK"'
+    )
+
+    _redact_secrets_from_log_record(record)
+
+    message = record.getMessage()
+    assert "b34eb5386c2b1b8a" not in message
+    assert "api_key=<redacted>" in message
+    assert "query=Edge" in message
+
+
+def test_redact_secrets_masks_api_key_passed_via_percent_args():
+    record = _log_record(
+        'HTTP Request: %s %s "%s %d %s"',
+        ("GET", "https://api.themoviedb.org/3/search/movie?api_key=b34eb5386c2b1b8a", "HTTP/1.1", 200, "OK"),
+    )
+
+    _redact_secrets_from_log_record(record)
+
+    message = record.getMessage()
+    assert "b34eb5386c2b1b8a" not in message
+    assert "api_key=<redacted>" in message
+
+
+def test_redact_secrets_leaves_non_secret_urls_unchanged():
+    record = _log_record('HTTP Request: GET https://api.thediscdb.com/graphql "HTTP/1.1 200 OK"')
+    original = record.getMessage()
+
+    _redact_secrets_from_log_record(record)
+
+    assert record.getMessage() == original
+
+
+# ── Graceful shutdown ──────────────────────────────────────────────────────────
+
+
+class _FakeServer:
+    should_exit = False
+
+
+@pytest.mark.asyncio
+async def test_shutdown_watcher_cancels_tasks_once_should_exit():
+    """Uvicorn only manages its own listener on a signal; `_shutdown_watcher`
+    is what makes the disc detector, job/rerun consumers, and any in-flight
+    disc pipeline actually stop once `server.should_exit` flips."""
+    server = _FakeServer()
+
+    async def _never_ending():
+        await asyncio.sleep(3600)
+
+    task_a = asyncio.create_task(_never_ending(), name="a")
+    task_b = asyncio.create_task(_never_ending(), name="b")
+    pipeline_task = asyncio.create_task(_never_ending(), name="pipeline")
+    pipeline_tasks = {pipeline_task}
+
+    watcher = asyncio.create_task(_shutdown_watcher(server, [task_a, task_b], pipeline_tasks))
+    await asyncio.sleep(0)  # let the watcher start polling
+    server.should_exit = True
+
+    await asyncio.wait_for(watcher, timeout=2)
+    await asyncio.gather(task_a, task_b, pipeline_task, return_exceptions=True)
+
+    assert task_a.cancelled()
+    assert task_b.cancelled()
+    assert pipeline_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_watcher_does_nothing_while_running():
+    server = _FakeServer()
+
+    async def _never_ending():
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(_never_ending())
+    watcher = asyncio.create_task(_shutdown_watcher(server, [task], set()))
+
+    await asyncio.sleep(0.1)  # a few poll intervals with should_exit still False
+
+    assert not watcher.done()
+    assert not task.cancelled()
+
+    watcher.cancel()
+    task.cancel()
+    await asyncio.gather(watcher, task, return_exceptions=True)

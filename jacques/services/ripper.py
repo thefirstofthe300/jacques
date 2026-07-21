@@ -52,6 +52,27 @@ def _disc_index(drive_path: str) -> int:
     return int(m.group())
 
 
+_SUBPROCESS_SHUTDOWN_TIMEOUT = 10  # seconds to wait after terminate() before escalating to kill()
+
+
+async def _terminate_and_wait(proc: asyncio.subprocess.Process) -> None:
+    """Ensure `proc` is dead before returning -- used from `finally` blocks so
+    cancelling a rip (e.g. daemon shutdown) never orphans a running
+    makemkvcon process. A no-op if the process has already exited.
+    """
+    if proc.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError, OSError):
+        proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=_SUBPROCESS_SHUTDOWN_TIMEOUT)
+    except (TimeoutError, asyncio.CancelledError):
+        with contextlib.suppress(ProcessLookupError, OSError):
+            proc.kill()
+        with contextlib.suppress(asyncio.CancelledError):
+            await proc.wait()
+
+
 class Ripper:
     def __init__(
         self,
@@ -74,21 +95,24 @@ class Ripper:
         )
         assert proc.stdout is not None
 
-        raw: dict[int, dict[int, str]] = {}
-        async for raw_line in proc.stdout:
-            line = raw_line.decode(errors="replace").strip()
-            if not line.startswith("TINFO:"):
-                continue
-            parts = line[6:].split(",", 3)
-            if len(parts) < 4:
-                continue
-            try:
-                title_id, attr_id = int(parts[0]), int(parts[1])
-            except ValueError:
-                continue
-            raw.setdefault(title_id, {})[attr_id] = parts[3].strip('"')
+        try:
+            raw: dict[int, dict[int, str]] = {}
+            async for raw_line in proc.stdout:
+                line = raw_line.decode(errors="replace").strip()
+                if not line.startswith("TINFO:"):
+                    continue
+                parts = line[6:].split(",", 3)
+                if len(parts) < 4:
+                    continue
+                try:
+                    title_id, attr_id = int(parts[0]), int(parts[1])
+                except ValueError:
+                    continue
+                raw.setdefault(title_id, {})[attr_id] = parts[3].strip('"')
 
-        await proc.wait()
+            await proc.wait()
+        finally:
+            await _terminate_and_wait(proc)
 
         titles: list[TitleInfo] = []
         for title_id, attrs in sorted(raw.items()):
@@ -172,29 +196,34 @@ class Ripper:
             poll_task = asyncio.create_task(_poll_size())
 
         try:
-            async for raw_line in proc.stdout:
-                line = raw_line.decode(errors="replace").strip()
-                if not line.startswith("PRGV:") or on_progress is None:
-                    continue
-                parts = line[5:].split(",")
-                if len(parts) == 3:
-                    try:
-                        current, maximum = int(parts[0]), int(parts[2])
-                        if maximum > 0:
-                            # PRGV is available — cancel the size poller.
-                            if poll_task is not None:
-                                poll_task.cancel()
-                                poll_task = None
-                            await on_progress(min(100, current * 100 // maximum))
-                    except ValueError:
-                        pass
-        finally:
-            if poll_task is not None:
-                poll_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await poll_task
+            try:
+                async for raw_line in proc.stdout:
+                    line = raw_line.decode(errors="replace").strip()
+                    if not line.startswith("PRGV:") or on_progress is None:
+                        continue
+                    parts = line[5:].split(",")
+                    if len(parts) == 3:
+                        try:
+                            current, maximum = int(parts[0]), int(parts[2])
+                            if maximum > 0:
+                                # PRGV is available — cancel the size poller.
+                                if poll_task is not None:
+                                    poll_task.cancel()
+                                    poll_task = None
+                                await on_progress(min(100, current * 100 // maximum))
+                        except ValueError:
+                            pass
+            finally:
+                if poll_task is not None:
+                    poll_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await poll_task
 
-        returncode = await proc.wait()
+            returncode = await proc.wait()
+        finally:
+            # Cancellation (e.g. daemon shutdown) must not orphan makemkvcon.
+            await _terminate_and_wait(proc)
+
         if returncode != 0:
             raise RuntimeError(f"makemkvcon exited with code {returncode}")
 

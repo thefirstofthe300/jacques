@@ -555,7 +555,7 @@ async def test_process_reruns_dispatches_pipeline(db_factory, tmp_path):
         patch("jacques.daemon.AsyncSessionLocal", db_factory),
         patch("jacques.daemon._run_pipeline", AsyncMock(side_effect=fake_pipeline)),
     ):
-        consumer = asyncio.create_task(daemon._process_reruns(queue))
+        consumer = asyncio.create_task(daemon._process_reruns(queue, set()))
         await queue.join()
         await asyncio.sleep(0)  # let the spawned pipeline task run
         consumer.cancel()
@@ -584,7 +584,7 @@ async def test_process_reruns_skips_unknown_job(db_factory, tmp_path):
         patch("jacques.daemon.AsyncSessionLocal", db_factory),
         patch("jacques.daemon._run_pipeline", AsyncMock(side_effect=fake_pipeline)),
     ):
-        consumer = asyncio.create_task(daemon._process_reruns(queue))
+        consumer = asyncio.create_task(daemon._process_reruns(queue, set()))
         await queue.join()
         consumer.cancel()
         await asyncio.gather(consumer, return_exceptions=True)
@@ -598,7 +598,7 @@ async def test_process_reruns_cancels_cleanly():
     from jacques import daemon
 
     queue: asyncio.Queue = asyncio.Queue()
-    task = asyncio.create_task(daemon._process_reruns(queue))
+    task = asyncio.create_task(daemon._process_reruns(queue, set()))
     await asyncio.sleep(0)  # let the task start and block on queue.get()
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)

@@ -1,9 +1,10 @@
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from jacques.services.ripper import Ripper, TitleInfo, _disc_index, _parse_duration
+from jacques.services.ripper import Ripper, TitleInfo, _disc_index, _parse_duration, _terminate_and_wait
 
 
 # ── pure unit tests (no I/O) ──────────────────────────────────────────────────
@@ -294,3 +295,98 @@ async def test_rip_raises_when_no_mkv_produced(tmp_path):
     with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
         with pytest.raises(RuntimeError, match="No MKV files"):
             await Ripper("/dev/sr0").rip(0, raw_dir)
+
+
+# ── cancellation-safe subprocess cleanup ──────────────────────────────────────
+#
+# A cancelled rip (e.g. daemon shutdown) must not leave makemkvcon running as
+# an orphan. These use a "hangs forever" stdout so the coroutine is reliably
+# suspended mid-read when cancelled, rather than racing to completion.
+
+
+async def _hanging_lines():
+    while True:
+        await asyncio.sleep(3600)
+        yield b""  # pragma: no cover -- never reached
+
+
+@pytest.mark.asyncio
+async def test_terminate_and_wait_noop_if_already_exited():
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+
+    await _terminate_and_wait(mock_proc)
+
+    mock_proc.terminate.assert_not_called()
+    mock_proc.kill.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_terminate_and_wait_terminates_running_process():
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+    mock_proc.wait = AsyncMock(return_value=0)
+
+    await _terminate_and_wait(mock_proc)
+
+    mock_proc.terminate.assert_called_once()
+    mock_proc.kill.assert_not_called()
+    mock_proc.wait.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_terminate_and_wait_escalates_to_kill_on_timeout(monkeypatch):
+    monkeypatch.setattr("jacques.services.ripper._SUBPROCESS_SHUTDOWN_TIMEOUT", 0.05)
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = None
+    wait_calls = 0
+
+    async def fake_wait():
+        nonlocal wait_calls
+        wait_calls += 1
+        if wait_calls == 1:
+            await asyncio.sleep(3600)  # ignores terminate(), forces the timeout
+        return 0
+
+    mock_proc.wait = fake_wait
+
+    await _terminate_and_wait(mock_proc)
+
+    mock_proc.terminate.assert_called_once()
+    mock_proc.kill.assert_called_once()
+    assert wait_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_get_disc_info_terminates_process_on_cancellation():
+    mock_proc = MagicMock()
+    mock_proc.stdout = _hanging_lines()
+    mock_proc.returncode = None
+    mock_proc.wait = AsyncMock(return_value=0)
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+        task = asyncio.create_task(Ripper("/dev/sr0").get_disc_info())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    mock_proc.terminate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_rip_terminates_process_on_cancellation(tmp_path):
+    mock_proc = MagicMock()
+    mock_proc.stdout = _hanging_lines()
+    mock_proc.returncode = None
+    mock_proc.wait = AsyncMock(return_value=0)
+
+    with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=mock_proc)):
+        task = asyncio.create_task(Ripper("/dev/sr0").rip(0, tmp_path / "raw"))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    mock_proc.terminate.assert_called_once()

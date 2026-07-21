@@ -3,6 +3,7 @@ import contextlib
 import dataclasses
 import json
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -511,16 +512,21 @@ async def _run_pipeline(
         log.info("Job %d complete", job_id)
 
     except Exception as exc:
+        log.exception("Job %d failed: %s", job_id, exc)
+        await _update_job(job_id, status=JobStatus.FAILED, error_message=str(exc))
+    finally:
+        # Cancellation (daemon shutdown) can land while metadata_task is still
+        # running concurrently with ripping -- clean it up on every exit path,
+        # not just the handled-exception one. A no-op once it's already been
+        # awaited on the success path.
         if metadata_task is not None and not metadata_task.done():
             metadata_task.cancel()
         if metadata_task is not None:
             with contextlib.suppress(BaseException):
                 await metadata_task
-        log.exception("Job %d failed: %s", job_id, exc)
-        await _update_job(job_id, status=JobStatus.FAILED, error_message=str(exc))
 
 
-async def _process_reruns(queue: asyncio.Queue[tuple[int, JobStatus]]) -> None:
+async def _process_reruns(queue: asyncio.Queue[tuple[int, JobStatus]], pipeline_tasks: set[asyncio.Task]) -> None:
     while True:
         try:
             job_id, start_stage = await queue.get()
@@ -535,17 +541,21 @@ async def _process_reruns(queue: asyncio.Queue[tuple[int, JobStatus]]) -> None:
                 log.warning("Rerun requested for unknown job %d — skipping", job_id)
                 continue
 
-            asyncio.create_task(
+            task = asyncio.create_task(
                 _run_pipeline(job_id, job.drive_path, job.disc_label, job.disc_uuid, start_stage),
                 name=f"rerun-{job_id}",
             )
+            pipeline_tasks.add(task)
+            task.add_done_callback(pipeline_tasks.discard)
         except Exception:
             log.exception("Failed to start rerun for job %d", job_id)
         finally:
             queue.task_done()
 
 
-async def _process_jobs(queue: asyncio.Queue[tuple[str, str | None, str | None]]) -> None:
+async def _process_jobs(
+    queue: asyncio.Queue[tuple[str, str | None, str | None]], pipeline_tasks: set[asyncio.Task]
+) -> None:
     while True:
         try:
             drive_path, disc_label, disc_uuid = await queue.get()
@@ -594,10 +604,12 @@ async def _process_jobs(queue: asyncio.Queue[tuple[str, str | None, str | None]]
                     continue
 
             # Each disc runs its pipeline independently so multiple drives work concurrently.
-            asyncio.create_task(
+            task = asyncio.create_task(
                 _run_pipeline(job_id, drive_path, disc_label, disc_uuid),
                 name=f"pipeline-{job_id}",
             )
+            pipeline_tasks.add(task)
+            task.add_done_callback(pipeline_tasks.discard)
         except Exception:
             log.exception("Failed to create job for drive %s", drive_path)
         finally:
@@ -626,12 +638,50 @@ async def _reset_interrupted_jobs() -> int:
     return len(interrupted)
 
 
+_SECRET_QUERY_PARAM_RE = re.compile(
+    r"(?<=[?&])(api_key|apikey|access_token|token|key)=[^&\s\"]+", re.IGNORECASE
+)
+
+
+def _redact_secrets_from_log_record(record: logging.LogRecord) -> bool:
+    """Redact secret-bearing query-string values (api_key, token, ...) from log lines.
+
+    httpx logs each outgoing request's full URL at INFO level, which for TMDb
+    includes `?api_key=...`. This rewrites the record's rendered message
+    in-place before it reaches any handler, rather than depending on httpx's
+    internal log-args format (method, url, ...), which isn't a stable API.
+    """
+    record.msg = _SECRET_QUERY_PARAM_RE.sub(r"\1=<redacted>", record.getMessage())
+    record.args = ()
+    return True
+
+
+async def _shutdown_watcher(
+    server: uvicorn.Server, tasks: list[asyncio.Task], pipeline_tasks: set[asyncio.Task]
+) -> None:
+    """Cancel every other background task once uvicorn's own SIGTERM/SIGINT handler fires.
+
+    Uvicorn installs its own signal handler and gracefully stops the ASGI
+    server on SIGTERM/SIGINT, flipping `should_exit` -- but that's all it
+    manages. The disc detector, job/rerun queue consumers, and each disc's
+    rip/transcode pipeline (spawned as detached tasks, see `_process_jobs`/
+    `_process_reruns`) have no cancellation wiring of their own, so without
+    this the process never actually exits on a signal; only SIGKILL did.
+    """
+    while not server.should_exit:
+        await asyncio.sleep(0.25)
+    log.info("Shutdown requested — stopping background tasks and any in-progress rip/transcode")
+    for task in [*tasks, *pipeline_tasks]:
+        task.cancel()
+
+
 async def run() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(message)s",
         handlers=[RichHandler(rich_tracebacks=True)],
     )
+    logging.getLogger("httpx").addFilter(_redact_secrets_from_log_record)
 
     settings.temp_path.mkdir(parents=True, exist_ok=True)
 
@@ -645,6 +695,7 @@ async def run() -> None:
     job_queue: asyncio.Queue[tuple[str, str | None, str | None]] = asyncio.Queue()
     rerun_queue: asyncio.Queue[tuple[int, JobStatus]] = asyncio.Queue()
     broadcaster = Broadcaster()
+    pipeline_tasks: set[asyncio.Task] = set()
 
     async def _on_disc_inserted(drive_path: str, disc_label: str | None, disc_uuid: str | None) -> None:
         await job_queue.put((drive_path, disc_label, disc_uuid))
@@ -657,6 +708,12 @@ async def run() -> None:
         port=settings.port,
         log_level="warning",
         access_log=False,
+        # Default is None (wait forever). The SPA holds a long-lived SSE
+        # connection open at /api/jobs/stream for live job updates, which
+        # never closes on its own -- without a bound, a single open browser
+        # tab makes uvicorn's own graceful shutdown (draining connections
+        # before returning) hang indefinitely on every restart.
+        timeout_graceful_shutdown=5,
     )
     server = uvicorn.Server(server_config)
 
@@ -667,6 +724,10 @@ async def run() -> None:
 
     async with asyncio.TaskGroup() as tg:
         tg.create_task(server.serve(), name="web-server")
-        tg.create_task(detector.run(), name="disc-detector")
-        tg.create_task(_process_jobs(job_queue), name="job-processor")
-        tg.create_task(_process_reruns(rerun_queue), name="rerun-processor")
+        detector_task = tg.create_task(detector.run(), name="disc-detector")
+        job_task = tg.create_task(_process_jobs(job_queue, pipeline_tasks), name="job-processor")
+        rerun_task = tg.create_task(_process_reruns(rerun_queue, pipeline_tasks), name="rerun-processor")
+        tg.create_task(
+            _shutdown_watcher(server, [detector_task, job_task, rerun_task], pipeline_tasks),
+            name="shutdown-watcher",
+        )
