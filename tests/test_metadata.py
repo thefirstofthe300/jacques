@@ -3,7 +3,7 @@ import pytest
 import respx
 
 from jacques.models.job import DiscType
-from jacques.services.metadata import MediaInfo, MetadataService
+from jacques.services.metadata import MediaInfo, MetadataService, _normalize_label
 
 _BASE = "https://api.themoviedb.org/3"
 
@@ -327,3 +327,17 @@ async def test_lookup_by_id_unknown_disc_type_treated_as_movie():
     assert result.title == "Fight Club"
     assert result.disc_type == DiscType.MOVIE
     assert result.tmdb_id == 550
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("EDGE_OF_TOMORROW", "Edge Of Tomorrow"),
+        ("DARKESTHOUR_UPB75", "Darkest Hour"),
+        ("THE_DARK_KNIGHT_RISES_BD50", "The Dark Knight Rises"),
+        ("DUNKIRK", "Dunkirk"),
+        ("MOVIE_UHD", "Movie"),
+    ],
+)
+def test_normalize_label_preserves_real_words(label, expected):
+    assert _normalize_label(label) == expected

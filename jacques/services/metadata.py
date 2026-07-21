@@ -11,8 +11,11 @@ log = logging.getLogger(__name__)
 
 _TMDB_BASE = "https://api.themoviedb.org/3"
 
-# Strips trailing disc edition codes like _UPB75, _BD50, _UHD, _4K.
-_EDITION_SUFFIX_RE = re.compile(r"(?:_[A-Z0-9]{2,8})+$")
+# Strips trailing disc edition codes like _UPB75, _BD50, _UHD, _4K. A token
+# only counts as an edition code if it contains a digit or is the literal
+# "UHD" — real title words in disc labels are always plain letters, so this
+# keeps e.g. EDGE_OF_TOMORROW intact instead of eating "OF_TOMORROW".
+_EDITION_SUFFIX_RE = re.compile(r"(?:_(?:UHD|[A-Z]*[0-9][A-Z0-9]*))+$")
 
 wordsegment.load()
 
